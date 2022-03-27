@@ -1,0 +1,623 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+library(mclust)
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(cowplot)
+library(ggforce)
+library(mgcv)
+library(modelr)
+library(ggforce)
+library(GGally)
+library(gt)
+theme_set(theme_cowplot())
+
+library(furrr)
+plan(multiprocess(workers = 6)) # Some steps require substantial memory when, reduce if you have memory problems, or switch back to regular walk/map.
+
+rad_to_deg <- function(rad) {
+  return ((rad * 180) / pi)
+}
+
+deg_to_rad <- function(deg) {
+  return((deg / 180) * pi)
+ }
+
+similarity <- function(v1, v2) {
+  num <- (v1 %*% v2)
+  den <- sqrt(v1 %*% v1) * sqrt(v2 %*% v2)
+  return(num / den)
+}
+
+```
+
+
+Distinct from the first chunk of figure_notebook.rmd, as this keeps all z-heights.
+```{r}
+load_file <- function(path) {
+  read_csv(path, col_types = cols()) %>%
+    mutate(file_name = str_extract(string = path, pattern = "[a-zA-z0-9_]*\\.txt"))
+}
+
+load_dir <- function(dir) {
+  file_list <- list.files(path = dir, pattern = "*.txt", full.names = T)
+  map_df(file_list, load_file)
+}
+
+myxo_data <- load_dir("./csv/raw_data") %>%
+  mutate(time_point = str_remove_all(str_extract(file_name, "_\\d\\dh_"),'_'), body_id = str_extract(file_name, "body_\\d+")) %>%
+  filter(sphericity <= 1) %>%
+  mutate(z_dist = WeightedCentroid_3 * 0.2,
+         z_dist = ifelse(body_id == "body_3" & time_point == "30h", z_dist - 0.5, z_dist))
+
+# Reclustering. Don't re-run this unless necessary, or you'll have to re-determine the classification.
+# myxo_data_subset <- myxo_data %>%
+#   select(EquivDiameter, SurfaceArea, SkeletonSize, MeanWidth, time_point) %>%
+#   mutate(logEquivDiameter = log(EquivDiameter),
+#          sqrtSurfaceArea = sqrt(SurfaceArea),
+#          logSqrtSurfaceArea = log(sqrtSurfaceArea),
+#          logSkeletonSize = log(SkeletonSize),
+#          logMeanWidth = log(MeanWidth)) %>%
+#   select(-EquivDiameter, -SurfaceArea, -SkeletonSize, -MeanWidth, -sqrtSurfaceArea)
+# myxo_clust <- myxo_data_subset %>%
+#   select(-time_point) %>%
+#   densityMclust(G = 4)
+# write_rds(myxo_clust, './rds/mclust_model.rds', compress = 'gz')
+#
+# Determine the classification
+# ggplot(myxo_data) +
+#    geom_point(aes(x = EquivDiameter %>% log, y = sphericity, col = classification), alpha = 0.75) +
+#   facet_grid(. ~ time_point)
+
+myxo_data_subset <- myxo_data %>%
+  select(EquivDiameter, SurfaceArea, SkeletonSize, MeanWidth, time_point) %>%
+  mutate(logEquivDiameter = log(EquivDiameter),
+         sqrtSurfaceArea = sqrt(SurfaceArea),
+         logSqrtSurfaceArea = log(sqrtSurfaceArea),
+         logSkeletonSize = log(SkeletonSize),
+         logMeanWidth = log(MeanWidth)) %>%
+  select(-EquivDiameter, -SurfaceArea, -SkeletonSize, -MeanWidth, -sqrtSurfaceArea, -time_point)
+
+mapping <- list("1" = "debris", "2" = "spore", "3" = "transitioning", "4" = "rod")
+clust_model <- read_rds('./rds/mclust_model.rds')
+pred <- predict.Mclust(clust_model, myxo_data_subset)
+
+myxo_data <- myxo_data %>%
+  ungroup() %>%
+  mutate(classification = pred$classification %>% as.factor(),
+         labels = mapping[classification %>% as.character()] %>% unlist(),
+         body_id = str_replace(body_id, "_(?=\\d$)", "_0"))
+
+myxo_data <- myxo_data %>%
+  group_by(body_id, time_point) %>%
+  filter(labels != "debris") %>%
+  mutate(labels_factor = factor(labels, levels = c("rod", "transitioning", "spore")),
+         label_time = str_c(labels, time_point),
+         dist_from_center = sqrt((WeightedCentroid_1 - mean(WeightedCentroid_1))^2 + (WeightedCentroid_2 - mean(WeightedCentroid_2))^2) * 0.1240,
+         z_dist = WeightedCentroid_3 * 0.2)
+
+write_rds(myxo_data, './rds/myxo_data_all_z.rds', compress = 'gz')
+write_csv(myxo_data, './csv/myxo_data_all_z.csv')
+```
+
+
+
+Cell orientation/alignemnt prep
+
+Eigenvectors to determine the cutoff between the disorganized center and the radially-aligned rods
+https://www.mathworks.com/matlabcentral/answers/398669-eigenvectors-and-eigenvalues-from-regionprops3?s_tid=answers_rc1-1_p1_Topic
+https://www.mathworks.com/matlabcentral/answers/406309-line-orientation-in-3d-from-centroid-and-euler-angles?s_tid=answers_rc1-1_p1_Topic
+
+See comment for confirmation that the largest eigenvalue, the first, is the major axis of the fitted ellipse. The orientation of each axis is stored in the eigenvectors. The first column of the eigenvector matrix is orientation of the major axis, the second column the intermediate axis, and the third column the minor axis. The first row describes the y-component [yes, the Y component], the second row describes the x-component [yes, the x-component], and the third row describes the z-component. So we need to extract the first two rows of the first column to give the x and y component of the orientation.
+
+Additionally, the PrincipalAxisLength does not necessarily describe the major, intermediate, and minor axis length. This is because the regionprops3 MATLAB function fits a probability distribution, and uses the variance term to calculate the axis length. If we were measuring ellipsoids, the exact major/intermediate/minor *radius* is principalAxisLengthN * sqrt(5/16). See: https://stackoverflow.com/a/56566779/11460621 for details. Cells are not exactly ellipsoids, so it is unclear how this affects our morphology parameters. For now, we will assume that the error is a constant factor everywhere, and can be ignored. We know that the volume measurements are okay, as it is calculated in a fundamentally different way. Validation tests of surface area show that the known surface area of an ellipsoid and the surface area returned by regionprops3 are very similar. 
+
+```{r}
+cells <- read_rds("./rds/myxo_data_all_z.rds") %>%
+  group_by(body_id, time_point) %>%
+  mutate(recentered_x = (Centroid_1 - mean(Centroid_1)) * 0.124,
+         recentered_y = (Centroid_2 - mean(Centroid_2)) * 0.124,
+         recentered_z = (Centroid_3 - mean(Centroid_3)) * 0.200) %>%
+  ungroup() %>%
+  mutate(coordinate_angle = atan2(x = recentered_x, y = recentered_y) %>% rad_to_deg) %>%
+  filter(labels_factor == "rod") %>%
+  mutate(row_id = 1:n())
+
+cells <- future_pmap_dfr(cells, function(...) {
+  t <- tibble(...)
+  # The exported matrix is in column order
+  eigenvector <- matrix(c(t$EigenVectors_1, t$EigenVectors_2, t$EigenVectors_3,
+                          t$EigenVectors_4, t$EigenVectors_5, t$EigenVectors_6,
+                          t$EigenVectors_7, t$EigenVectors_8, t$EigenVectors_9), nrow = 3, ncol = 3, byrow = F)
+  eigenvals <- c(t$EigenValues_1, t$EigenValues_2, t$EigenValues_3)
+  cell_eigenvec <- eigenvector[,1] # First column is the major axis, second col is the intermediate axis, third is the minor axis
+  cell_eigenvec <- cell_eigenvec %>% as.numeric()
+  cell_eigenvec <- cell_eigenvec[1:2] # The initial ordering of the eigenvector column is y, x, z. See links above.
+  cell_eigenvec_xy <- c(cell_eigenvec[2], cell_eigenvec[1])  # Switches to "normal" (x, y) order
+  
+  # Radial alignment is based on the 2D projection, not 3D orientation
+  cell_coord <- c(t$recentered_x, t$recentered_y) 
+  tangential_vec <- c(cell_coord[2], -cell_coord[1]) # Rotate 90CW so that instead of a vector orthogonal to the circle, it is tangential.
+  
+  t$radial_alignment <- similarity(cell_eigenvec_xy, tangential_vec)
+  t$abs_radial_alignment <- abs(t$radial_alignment) # Cells don't have a "directionality"; so -1 and 1 are indistinguishable
+  t$radial_orthogonality <- similarity(cell_eigenvec_xy, cell_coord)
+  t$abs_radial_orthogonality <- abs(t$radial_orthogonality)
+
+  t$principal_eigen_x <- eigenvector[2, 1] # Again, see links above for the unusual ordering of this column
+  t$principal_eigen_y <- eigenvector[1, 1]
+  t$principal_eigen_z <- eigenvector[3, 1]
+  
+  t$cell_angle <- atan(t$principal_eigen_y / t$principal_eigen_x) # The angle of the cell in the xy-plane
+  t$abs_cell_angle <- abs(t$cell_angle)
+  t$angle_from_tangent <- t$abs_radial_alignment %>% acos() %>% rad_to_deg() # How many degrees away from being exactly tangential
+  return(t)
+})
+
+cells <- future_pmap_dfr(cells, function(...) {
+  row = tibble(...)
+  r_vec <- c(row$principal_eigen_x, row$principal_eigen_y, row$principal_eigen_z) # Neighbor alignment is based on the 3D orientation
+  
+  neighbors <- cells %>%
+    filter(body_id == row$body_id, time_point == row$time_point, row_id != row$row_id) %>%
+    mutate(dist = sqrt((row$recentered_x - recentered_x)^2 + (row$recentered_y - recentered_y)^2 + (row$recentered_z - recentered_z)^2)) %>%
+    mutate(neighbor_similarity = pmap_dbl(list(principal_eigen_x, principal_eigen_y, principal_eigen_z), .f = ~similarity(c(..1, ..2, ..3), r_vec)) %>% abs())
+  
+  return(row %>% mutate(avg_abs_neighbor_sim = weighted.mean(neighbors$neighbor_similarity,
+                                                             w = exp(-((neighbors$dist) / 2.5)^2)))) # denominator determines the scale of the normal distribution (in um)
+})
+
+write_rds(cells, "./rds/cells_angle_data.rds", compress = "gz") 
+```
+
+brms model of angle/alignment over radius
+```{r}
+cells <- read_rds("./rds/cells_angle_data.rds") %>%
+  mutate(dummy = 1.0)
+
+gam_condition <- function(filtered_data, label_str, bformula) {
+  print(label_str)
+  (pr <- get_prior(bformula, data = filtered_data))
+  pr$prior[pr$group == "body_id"] = "exponential(1)"
+  
+  fit <- brm(bformula, data = filtered_data, cores = 4, chains = 4, warmup = 250,
+             iter = 500, control = list("max_treedepth" = 15, "metric" = "diag_e", "adapt_delta" = 0.99))
+  
+  write_rds(fit, file = str_glue("./rds/model_rds/radius_angle_align/{label_str}.rds"), compress = "gz")
+}
+
+angle_formula <- bf(abs_radial_alignment ~ 1 + s(dist_from_center) + s(dist_from_center, body_id, dummy, bs='re'),
+              phi ~ 1 + s(dist_from_center) + s(dist_from_center, body_id, dummy, bs='re'), family = Beta)
+future_walk(list("27h", "30h", "36h", "48h"), ~ filter(cells, time_point == .x) %>% gam_condition(label_str = str_glue("gam_angle_{.x}"), bformula = angle_formula))
+
+alignment_formula <- bf(avg_abs_neighbor_sim ~ 1 + s(dist_from_center) + s(dist_from_center, body_id, dummy, bs='re'),
+              phi ~ 1 + s(dist_from_center) + s(dist_from_center, body_id, dummy, bs='re'), family = Beta)
+future_walk(list("27h", "30h", "36h", "48h"), ~ filter(cells, time_point == .x) %>% gam_condition(label_str = str_glue("gam_alignment_{.x}"), bformula = alignment_formula))
+```
+
+Merge model data
+```{r}
+plot_radial_angle <- function(filepath, name, in_body_id) {
+  print(str_glue("Loading {filepath}"))
+  fit <- read_rds(filepath)
+  
+  body_group <- list("body_01", "body_13", "body_14", "body_15", "body_16", "body_17", "body_18", "body_19",
+                     "body_02", "body_20", "body_21", "body_22", "body_23", "body_24", "body_03")
+  
+  pred_no_body <- data_grid(fit$data, dist_from_center = seq(0, 60, 0.2),
+                            body_id = in_body_id %>% factor(levels = body_group), dummy = 0) %>%
+    filter(body_id == in_body_id) %>%
+    add_fitted_draws(fit, n = 1000) %>%
+    mutate(name = name, time_point = str_extract(name, "\\d{2}h"))
+
+  return(pred_no_body)
+}
+
+all_angle_models <- map_df(list.files("./rds/model_rds/radius_angle_align", pattern = ".*angle.*\\.rds$", full.names = T),
+                   ~ plot_radial_angle(.x, str_extract(.x, "(?<=/)[A-Za-z_0-9]*(?=\\.rds$)"), "body_01"))
+write_rds(all_angle_models, file = "./rds/model_rds/merged_angle_phi_models.rds", compress = "gz")
+
+all_align_models <- map_df(list.files("./rds/model_rds/radius_angle_align", pattern = ".*alignment.*\\.rds$", full.names = T),
+                   ~ plot_radial_angle(.x, str_extract(.x, "(?<=/)[A-Za-z_0-9]*(?=\\.rds$)"), "body_01"))
+write_rds(all_align_models, file = "./rds/model_rds/merged_alignment_models.rds", compress = "gz")
+```
+
+
+Correlating draws from fluorescent data
+```{r}
+chrono_order <- function(align, fluor) { # Predicate to cross needs to be TRUE for discard and FALSE for keep.
+  talign <- str_extract(align, "\\d\\d(?=h)") %>% as.numeric()
+  tfluor <- str_extract(fluor, "\\d\\d(?=h)") %>% as.numeric()
+  if (talign <= tfluor) {
+    return(FALSE)
+  } else {
+    return(TRUE)
+  }
+}
+
+calc_regression <- function(orientation_path, fluor_path, cell_type, analysis_name) {
+  print(str_glue("Analyzing angle {orientation_path}, fluor {fluor_path}, with name {analysis_name}"))
+  orientation_fit <- read_rds(orientation_path)
+  fluor_fit <- read_rds(fluor_path)
+  cell_type_str <- str_c(cell_type, collapse = "_")
+  
+  body_group <- c("body_01", "body_13", "body_14", "body_15", "body_16", "body_17", "body_18", "body_19",
+                  "body_02", "body_20", "body_21", "body_22", "body_23", "body_24", "body_03")
+  
+  if (str_detect(fluor_path, "dev")) {
+    body_group_fluor <-  c("body_19", "body_20", "body_21")
+  } else if (str_detect(fluor_path, "fmgE")) {
+    body_group_fluor <- c("body_22", "body_23", "body_24")
+  } else if (str_detect(fluor_path, "gam_label")) {
+    body_group_fluor <- body_group
+  } else {
+    stop("Could not determine type of response")
+  }
+  
+  if(str_detect(orientation_path, "gam_angle")) {
+    type <- "angle"
+  } else if (str_detect(orientation_path, "gam_alignment")) {
+    type <- "alignment"
+  } else if (str_detect(orientation_path, "gam_density")) {
+    type <- "density"
+  } else if (str_detect(orientation_path, "gam_label")) {
+    type <- "label"
+  } else {
+    stop("Could not determine type of orientation")
+  }
+  
+  if (type == "density") {
+    orientation_draws <- data_grid(orientation_fit$data, left_pt = seq(0, 50, 1),
+                           body_id = "body_01" %>% factor(levels = body_group), dummy = 0) %>%
+    filter(body_id == "body_01") %>%
+    add_fitted_draws(orientation_fit, n = 40000, seed = runif(1, 0, 2^31) %>% round()) %>%
+    rename(orientation_fit = .value,
+           dist_from_center = left_pt) %>%
+    mutate(joiner = str_c(dist_from_center, .draw, sep = "_"))
+  } else if (type == "angle") {
+    orientation_draws <-data_grid(orientation_fit$data, dist_from_center = seq(0, 50, 1),
+                           body_id = "body_01" %>% factor(levels = body_group), dummy = 0) %>%
+    filter(body_id == "body_01") %>%
+    add_fitted_draws(orientation_fit, n = 1000, seed = runif(1, 0, 2^31) %>% round()) %>%
+    rename(orientation_fit = .value) %>%
+    mutate(joiner = str_c(dist_from_center, .draw, sep = "_"))
+  } else if (type == "alignment") {
+    orientation_draws <-data_grid(orientation_fit$data, dist_from_center = seq(0, 50, 1),
+                           body_id = "body_01" %>% factor(levels = body_group), dummy = 0) %>%
+    filter(body_id == "body_01") %>%
+    add_fitted_draws(orientation_fit, n = 1000, seed = runif(1, 0, 2^31) %>% round()) %>%
+    rename(orientation_fit = .value) %>%
+    mutate(joiner = str_c(dist_from_center, .draw, sep = "_"))
+  } else if (type == "label") {
+    orientation_draws <- data_grid(orientation_fit$data, r = seq(0, 50, 1),
+                             body_id = body_group_fluor[1] %>% factor(levels = body_group_fluor),
+                             labels_factor = "spore" %>% factor(levels = c("rod", "transitioning", "spore")), # NOTE: Only does spores.
+                             dummy = 0) %>%
+      filter(body_id == body_group_fluor[1], labels_factor == "spore") %>%
+      add_fitted_draws(orientation_fit, n = 40000) %>%
+      filter(.category == "spore") %>%
+      rename(orientation_fit = .value,
+             dist_from_center = r) %>%
+      mutate(joiner = str_c(dist_from_center, .draw, sep = "_"))
+  } else {
+    stop("Could not determine type of orientation")
+  }
+  
+  if (str_detect(fluor_path, "dev") || str_detect(fluor_path, "fmgE")) {
+    fluor_draws <- data_grid(fluor_fit$data, dist_from_center = seq(0, 50, 1),
+                             body_id = body_group_fluor[1] %>% factor(levels = body_group_fluor),
+                             labels_factor = cell_type %>% factor(levels = c("rod", "transitioning", "spore")),
+                             dummy = 0) %>%
+      filter(body_id == body_group_fluor[1], labels_factor %in% cell_type) %>%
+      add_fitted_draws(fluor_fit, n = 1000) %>%
+      compare_levels(variable = .value, by = .category, comparison = list(c("ch2meanlog", "ch1meanlog"))) %>%
+      rename(fluor_fit = .value) %>%
+      mutate(joiner = str_c(dist_from_center, .draw, sep = "_"))
+  } else if (str_detect(fluor_path, "label")) {
+    fluor_draws <- data_grid(fluor_fit$data, r = seq(0, 50, 1),
+                             body_id = body_group_fluor[1] %>% factor(levels = body_group_fluor),
+                             labels_factor = cell_type %>% factor(levels = c("rod", "transitioning", "spore")),
+                             dummy = 0) %>%
+      filter(body_id == body_group_fluor[1], labels_factor %in% cell_type) %>%
+      add_fitted_draws(fluor_fit, n = 40000) %>%
+      filter(.category %in% cell_type) %>%
+      rename(fluor_fit = .value,
+             dist_from_center = r) %>%
+      mutate(joiner = str_c(dist_from_center, .draw, sep = "_"))
+  } else {
+    stop("Could not determine type of response")
+  }
+
+  ttt <- inner_join(fluor_draws, orientation_draws, by = "joiner")
+  pts_corr <- cor(ttt$orientation_fit, ttt$fluor_fit, method = "pearson")
+
+  tibble(name = analysis_name, corr = pts_corr, type = type, orientation_file = orientation_path, fluor_file = fluor_path)
+}
+
+make_cell_type_plots <- function(all_orientation_files, all_resp_files, cell_types = list("rod", "transitioning", "spore", c("rod", "transitioning", "spore"))) {
+
+  all_relevant_combos <- cross3(all_orientation_files, all_resp_files, cell_types, .filter = ~chrono_order(.x, .y))
+
+  human_readable <- tibble(orientation_files = map(all_relevant_combos, ~.x[[1]]),
+                           fluor_files = map(all_relevant_combos, ~.x[[2]]),
+                           cell_type = map(all_relevant_combos, ~.x[[3]])) %>%
+    mutate(run_names = str_c(str_extract(orientation_files, "(?<=gam_).*(?=.rds)"),
+                             str_extract(fluor_files, "(?<=gam_).*(?=.rds)"), sep = "_")) #multiple cell types at the same time doesn't make sense for labels
+  
+  # Reduce multiprocesses workers or revert to pmap_dfr if you're running out of memory.
+  lagged_correlations <- future_pmap_dfr(list(human_readable$orientation_files, human_readable$fluor_files, human_readable$run_names, human_readable$cell_type),
+                                         ~calc_regression(..1, ..2, ..4, str_c(..3, ..4, collapse = "_", sep = "_")),
+                                         .options = furrr_options(seed = TRUE))
+}
+
+set.seed(1604881008) # A random, but consistent, seed to ensure sampling is "deterministic"
+
+orientation_files <- c(list.files("./rds/model_rds/radius_angle_align", pattern = "gam_(angle|alignment)_\\d\\dh\\.rds", full.names = T),
+                       list.files("./rds/model_rds/radius_density", pattern = "gam_density_\\d\\dh\\.rds", full.names = T))
+
+resp_files <- c(list.files("./rds/model_rds/radius_intensity", pattern = "gam_fluor_\\d\\dh_(dev|fmgE).rds", full.names = T),
+                list.files("./rds/model_rds/radius_label", pattern = "gam_label_\\d\\dh.rds", full.names = T))
+
+# Slow
+# res <- make_cell_type_plots(orientation_files, resp_files) 
+# 
+# write_rds(res, "./rds/model_rds/radius_angle_alignment_density_corrs.rds", compress = "gz")
+
+res <- read_rds("./rds/model_rds/radius_angle_alignment_density_corrs.rds")
+
+ttt <- res %>%
+  mutate(time_align = str_extract(name, "(angle|alignment|radial)_\\d\\dh"),
+         time_fluor = str_extract(name, "(fluor|label)_\\d\\dh"),
+         promoter = str_extract(name, "(dev|fmgE)"),
+         cell_type = str_extract_all(name, "(rod|transitioning|spore)") %>% str_c(),
+         corr = round(corr, 3)) %>%
+  select(-name)
+
+align_table <- filter(ttt, type == "alignment")
+write_csv(align_table, "./csv/arrangement/corr_values_align.csv")
+
+angle_table <- filter(ttt, type == "angle")
+write_csv(angle_table, "./csv/arrangement/corr_values_angle.csv")
+
+density_table <- filter(ttt, type == "density")
+write_csv(density_table, "./csv/arrangement/corr_values_density.csv")
+```
+
+Pretty correlation tables -- angle
+```{r}
+angle <- read_csv('./csv/arrangement/corr_values_angle.csv') %>%
+  select(-orientation_file,-fluor_file,-type) %>%
+  mutate(corr = round(corr, digits=2))
+
+angle_fluor_dev_gt <- angle %>%
+  filter(str_detect(time_fluor,'fluor'), str_detect(promoter,'dev')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_align') %>%
+  data_color(
+    columns = starts_with('fluor_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(angle_fluor_dev_gt, './csv/arrangement/angle_fluor_dev.html')
+gtsave(angle_fluor_dev_gt, './csv/arrangement/angle_fluor_dev.png')
+
+angle_fluor_fmgE_gt <- angle %>%
+  filter(str_detect(time_fluor,'fluor'), str_detect(promoter,'fmgE')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_align') %>%
+  data_color(
+    columns = starts_with('fluor_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(angle_fluor_fmgE_gt, './csv/arrangement/angle_fluor_fmgE.html')
+gtsave(angle_fluor_fmgE_gt, './csv/arrangement/angle_fluor_fmgE.png')
+
+angle_label_gt <- angle %>%
+  filter(str_detect(time_fluor,'label')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_align') %>%
+  data_color(
+    columns = starts_with('label_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(angle_label_gt, './csv/arrangement/angle_label.html')
+gtsave(angle_label_gt, './csv/arrangement/angle_label.png')
+```
+
+Pretty correlation tables -- alignment
+```{r}
+align <- read_csv('./csv/arrangement/corr_values_align.csv') %>%
+  select(-orientation_file,-fluor_file,-type) %>%
+  mutate(corr = round(corr,digits=2))
+
+align_fluor_dev_gt <- align %>%
+  filter(str_detect(time_fluor,'fluor'), str_detect(promoter,'dev')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_align') %>%
+  data_color(
+    columns = starts_with('fluor_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(align_fluor_dev_gt, './csv/arrangement/align_fluor_dev.html')
+gtsave(align_fluor_dev_gt, './csv/arrangement/align_fluor_dev.png')
+
+align_fluor_fmgE_gt <- align %>%
+  filter(str_detect(time_fluor,'fluor'), str_detect(promoter,'fmgE')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_align') %>%
+  data_color(
+    columns = starts_with('fluor_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(align_fluor_fmgE_gt, './csv/arrangement/align_fluor_fmgE.html')
+gtsave(align_fluor_fmgE_gt, './csv/arrangement/align_fluor_fmgE.png')
+
+align_label_gt <- align %>%
+  filter(str_detect(time_fluor,'label')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_align') %>%
+  data_color(
+    columns = starts_with('label_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(align_label_gt, './csv/arrangement/align_label.html')
+gtsave(align_label_gt, './csv/arrangement/align_label.png')
+```
+
+Pretty correlation tables -- density
+```{r}
+density <- read_csv('./csv/arrangement/corr_values_density.csv') %>%
+  select(-orientation_file,-fluor_file,-type) %>%
+  mutate(corr = round(corr,digits=2))
+
+density_fluor_dev_gt <- density %>%
+  filter(str_detect(time_fluor,'fluor'), str_detect(promoter,'dev')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_density') %>%
+  data_color(
+    columns = starts_with('fluor_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(density_fluor_dev_gt, './csv/arrangement/density_fluor_dev.html')
+gtsave(density_fluor_dev_gt, './csv/arrangement/density_fluor_dev.png')
+
+density_fluor_fmgE_gt <- density %>%
+  filter(str_detect(time_fluor,'fluor'), str_detect(promoter,'fmgE')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_density') %>%
+  data_color(
+    columns = starts_with('fluor_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(density_fluor_fmgE_gt, './csv/arrangement/density_fluor_fmgE.html')
+gtsave(density_fluor_fmgE_gt, './csv/arrangement/density_fluor_fmgE.png')
+
+density_label_gt <- density %>%
+  filter(str_detect(time_fluor,'label')) %>%
+  pivot_wider(names_from = time_fluor, values_from = corr) %>%
+  gt(rowname_col = 'time_density') %>%
+  data_color(
+    columns = starts_with('label_'),
+    colors = scales::col_numeric(
+      palette = c('yellow','white','blue'),
+      domain = c(-1,1)
+    ),
+    apply_to = c("fill"),
+    autocolor_text = TRUE
+  )
+
+gtsave(density_label_gt, './csv/arrangement/density_label.html')
+gtsave(density_label_gt, './csv/arrangement/density_label.png')
+```
+
+
+Figure 3B -- Radial distribution of alignment and orientation
+```{r}
+align_data <- read_rds("./rds/model_rds/merged_angle_phi_models.rds") %>% mutate(type = "neighbor alignment")
+angle_data <- read_rds("./rds/model_rds/merged_alignment_models.rds") %>% mutate(type = "tangential orientation")
+
+both_data <- bind_rows(align_data, angle_data) %>% 
+  mutate(time_point = str_replace(time_point, "h", " h"))
+
+alignment_color <- "mediumorchid4"
+orientation_color <- "orange4"
+
+(both_plot_legend <- both_data %>%
+  ggplot() +
+  stat_lineribbon(aes(x = dist_from_center, y = .value, col = type, fill = type), .width = s0.9, alpha = 0.333, point_interval = median_hdci) +
+  facet_grid(. ~ time_point) +
+  scale_color_manual(values = c("neighbor alignment" = alignment_color, "tangential orientation" = orientation_color)) +
+  scale_fill_manual(values =  c("neighbor alignment" = alignment_color, "tangential orientation" = orientation_color)) +
+  labs(x = "Distance from center (μm)", y = "Cosine similarity", fill = "", col = "") +
+  guides(fill = "none") +
+  scale_y_continuous(labels = function(x) {sprintf("%.2f", x)})+
+  theme(legend.position = "top", axis.text = element_text(size=18), legend.text = element_text(size=18), axis.title = element_text(size=18), strip.text = element_text(size=18)))
+
+ggsave(filename = "./figure_3/figure_3B_alignment_orientation_radial.png", plot = both_plot_legend, width = 12, height = 3.75, bg = "white")
+```
+
+
+Radial contrasts
+```{r}
+contrast_radial <- function(fit_data, name) {
+  r_vals <- fit_data %>%
+    ungroup() %>%
+    group_by(dist_from_center) %>%
+    summarise(median_val = median(.value))
+  
+  max_row <- which.max(r_vals$median_val)
+  
+  r_vals[max_row,] %>% mutate(metadata = name) %>% write_csv(str_glue("./csv/arrangement/{name}_max_distances.csv"))
+  
+  td <- fit_data %>%
+    filter(dist_from_center %in% c(1, 60, r_vals[max_row,]$dist_from_center)) %>%
+    compare_levels(variable = .value, by = dist_from_center) %>%
+    mutate(run_name = name)
+
+  map_df(td$dist_from_center %>% unique(), ~ hypothesis(filter(td, dist_from_center == .x),
+                                                        c(".value > 0", ".value < 0"))$hypothesis %>% mutate(r_comparison = .x)) %>%
+    mutate(metadata = name) %>%
+    write_csv(str_glue("./csv/arrangement/arrangement_{name}_hypothesis.csv"))
+}
+
+align_data <- read_rds("./rds/model_rds/merged_alignment_models.rds") %>% mutate(type = "alignment")
+angle_data <- read_rds("./rds/model_rds/merged_angle_phi_models.rds") %>% mutate(type = "orientation")
+
+walk(align_data$time_point %>% unique(), ~contrast_radial(align_data %>% filter(time_point == .x), str_c("alignment_", .x)))
+walk(angle_data$time_point %>% unique(), ~contrast_radial(angle_data %>% filter(time_point == .x), str_c("angle_", .x)))
+```

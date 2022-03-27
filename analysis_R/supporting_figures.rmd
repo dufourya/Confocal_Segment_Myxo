@@ -1,0 +1,632 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+Run all blocks in figure_notebook and cell_alignment_notebook before generating these figures.
+```{r}
+library(mclust)
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(cowplot)
+library(ggforce)
+library(mgcv)
+library(modelr)
+library(GGally)
+theme_set(theme_cowplot())
+
+library(furrr)
+plan(multiprocess(workers = 4)) # Some of future_maps require a lot of memory, reduce workers if you're running out.
+
+current_script_dir <- dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(current_script_dir)
+```
+
+
+
+Figure Supplemental 2B -- Spore concentrations and contrast in FM 4-64
+```{r}
+spore_counts <- read_csv("./csv/spores.csv", col_types = cols()) %>%
+  mutate(concentration = factor(concentration, c("0", "2")))
+
+(spore_plot <- ggplot(spore_counts) + 
+    geom_point(aes(x = concentration, y = spores, shape = group), size = 5) +
+    labs(x = expression(FM~4-64~concentration~(μg/mL)), y = "spores/mL") + 
+    theme(text = element_text(size = 20), axis.text = element_text(size = 18), legend.position = "none"))
+
+spore_formula <- bf(spores ~ 0 + concentration + (0 + concentration|group))
+
+generic_prior <- "student_t(3, 5000, 3000)"
+
+(spore_prior <- get_prior(spore_formula, data = spore_counts))
+spore_prior$prior[spore_prior$prior == "" & spore_prior$class == "b"] = generic_prior
+(spore_prior)
+
+spore_model <- brm(formula = spore_formula, data = spore_counts, chains = 4, cores = 4, warmup = 1000, iter = 11000,
+                   control = list("adapt_delta" = 0.9999, "max_treedepth" = 15, metric = "dense_e"), sample_prior = T, save_all_pars = T)
+write_rds(spore_model, "./rds/model_rds/spore_model.rds", compress = "gz")
+
+spore_model <- read_rds("./rds/model_rds/spore_model.rds")
+
+(spore_contrast <- spore_model %>%
+    gather_draws(`b_concentration.*`, regex = T) %>%
+    compare_levels(variable = .value, by = .variable, fun = `-`) %>%
+    ggplot() +
+    stat_pointinterval(aes(x = .value, y = .variable), point_interval = median_hdci) +
+    geom_vline(xintercept = 0, col = "firebrick") +
+    labs(y = "", x = "Δ spores/mL") +
+    scale_y_discrete(labels = "2 - 0 μg/mL FM 4-64"))
+
+contrast_df <- spore_model %>%
+  gather_draws(`b_concentration.*`, regex = T) %>%
+  compare_levels(variable = .value, by = .variable, fun = `-`)
+
+contrast_grob <- ggplotGrob(ggplot(contrast_df) + 
+                              stat_pointinterval(aes(x = .value, y = .variable), point_interval = median_hdci, .width = c(0.90, 0.98), point_size = 5, shape = "+") +
+                              geom_vline(xintercept = 0, linetype = 2) +
+                              labs(y = "", x = "Δ spores/mL") +
+                              scale_y_discrete(labels = "2 - 0 μg/mL\nFM 4-64") +
+                              theme(text = element_text(size = 20), axis.text = element_text(size = 18), legend.position = "none")
+)
+
+(final_plot <- spore_plot +
+    annotation_custom(grob = contrast_grob, xmin = 0.333, ymin = 8000, xmax = 2.333, ymax = 11000) +
+    ylim(3000, 11000))
+
+ggsave("./figure_supplemental/figure_supplemental_2B_spore_plot.png", plot = final_plot, width = 8, height = 5, dpi = 300, bg = "white")
+
+# Hypothesis test for FM 4-64 effect
+(spore_pval <- hypothesis(spore_model, "concentration2 > concentration0", alpha = 0.05))
+write_csv(spore_pval$hypothesis, "./csv/hypothesis/figure_supplemental_2B_spore_contrast_hypothesis.csv")
+```
+
+
+
+Figure Supplemental 4 -- Plotting cluster data
+```{r}
+clust_model <- read_rds('./rds/mclust_model.rds')
+
+dr <- MclustDR(clust_model)
+
+myxo_data <- read_rds("./rds/myxo_data.rds")
+
+combofn <- function(data, mapping, ...){ # This is the normal plotting code for ggpairs histograms, but we need to make sure all hists have the same y-axis
+  
+  mapping <- mapping_color_to_fill(mapping)
+  
+  horizontal <- is_horizontal(data, mapping)
+  
+  if (!horizontal) {
+    mapping <- mapping_swap_x_y(mapping)
+  }
+  
+  xVal <- mapping_string(mapping$x)
+  yVal <- mapping_string(mapping$y)
+  mapping$y <- NULL
+  
+  p <- ggplot(data = data, mapping)
+  p <- p + stat_bin(...)
+  
+  if (horizontal) {
+    p <- p +
+      facet_grid(paste(yVal, " ~ .", sep = "")) +
+      theme(panel.spacing = unit(0.1, "lines"))
+  } else {
+    p <- p +
+      facet_grid(paste(". ~", yVal, sep = "")) +
+      theme(panel.spacing = unit(0.1, "lines")) +
+      coord_flip()
+  }
+  p <- p + labs(x = xVal, y = yVal)
+  
+  p + scale_y_continuous(limits = c(0, 1500))
+}
+
+(cluster_pairs <- myxo_data %>%
+    ungroup() %>%
+    select(labels_factor, EquivDiameter, SurfaceArea, SkeletonSize, MeanWidth) %>%
+    mutate(EquivDiameter = log(EquivDiameter),
+           SurfaceArea = log(sqrt(SurfaceArea)),
+           SkeletonSize = log(SkeletonSize),
+           MeanWidth = log(MeanWidth)) %>%
+    rename(`Number of cells` = labels_factor,
+           `log(Equivalent diameter [px])` = EquivDiameter,
+           `log(sqrt(Surface area [px^2]))` = SurfaceArea,
+           `log(length [px])` = SkeletonSize,
+           `log(mean width [px])` = MeanWidth) %>%
+    ggpairs(aes(col = `Number of cells` ),
+            diag = list(continuous = "blankDiag", discrete = "blankDiag", na = "blankDiag"),
+            upper = list(discrete = "blankDiag", na = "blankDiag", combo = "blankDiag"),
+            lower = list(combo = combofn), switch = "both", showStrips = F,
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = T),
+          text = element_text(size = 16)))
+
+ggsave("./figure_supplemental/figure_supplemental_4.png", bg = "white", plot = cluster_pairs, width = 16, height = 16)
+```
+
+
+
+
+Figure Supplemental 5 -- Models on morphological properties of cell classifications
+```{r}
+cell_data <- read_rds("./rds/myxo_data.rds") %>%
+  ungroup() %>%
+  mutate(log_equiv_diameter_um = log(EquivDiameter * 0.1240),
+         equiv_diameter_um = EquivDiameter * 0.1240,
+         sphericity = (((6*Volume) ^ (2/3)) * (pi ^ (1/3))) / SurfaceArea,
+         log_length_um = log(SkeletonSize * 0.1240),
+         log_mean_width_um = log(MeanWidth * 0.1240))
+
+equiv_diameter_formula <- bf(log_equiv_diameter_um ~ 0 + labels + (labels | body_id : time_point), family = gaussian)
+sphericity_formula <- bf(sphericity ~ 0 + labels + (labels | body_id : time_point), phi ~ 0 + labels + (labels | body_id : time_point), family = Beta)
+length_formula <- bf(log_length_um ~ 0 + labels + (labels | body_id : time_point), family = gaussian)
+mean_width_formula <- bf(log_mean_width_um ~ 0 + labels + (labels | body_id : time_point), family = gaussian)
+
+mv_shape_formula <- mvbf(equiv_diameter_formula, sphericity_formula, length_formula, mean_width_formula)
+
+generic_prior <- "student_t(3, 0, 3)"
+
+(mv_shape_prior <- get_prior(mv_shape_formula, data = cell_data))
+mv_shape_prior$prior[mv_shape_prior$class == "sigma"] = "exponential(1)"
+mv_shape_prior$prior[mv_shape_prior$class == "sd"] = "exponential(0.333)"
+mv_shape_prior$prior[mv_shape_prior$prior == "" & mv_shape_prior$class != "cor"] = generic_prior
+mv_shape_prior$prior[mv_shape_prior$resp == "" ] = ""
+mv_shape_prior$prior[mv_shape_prior$prior == generic_prior & mv_shape_prior$coef == ""] = ""
+mv_shape_prior$prior[mv_shape_prior$class == "cor" & mv_shape_prior$group == ""] = "lkj(1)"
+(mv_shape_prior)
+
+# This model takes a long time to run.
+mv_shape_model <- brm(mv_shape_formula + set_rescor(FALSE),
+                      data = cell_data, chains = 4, cores = 4, inits = 0, prior = mv_shape_prior,
+                      iter = 2250, warmup = 250, control = list("metric" = "diag_e", "max_treedepth" = 16))
+
+write_rds(mv_shape_model, "./rds/model_rds/mv_shape_model_tp_interact.rds", compress = "gz")
+```
+
+Figure Supplemental 5A -- Generate model draws
+```{r}
+mv_shape_model <- read_rds("./rds/model_rds/mv_shape_model_tp_interact.rds")
+
+cell_data <- mv_shape_model$data %>%
+  mutate(labels = factor(labels, levels = c("rod", "transitioning", "spore"))) 
+
+fitted_data <- cell_data %>%
+  data_grid(labels) %>%
+  add_fitted_draws(mv_shape_model, re_formula = NA) %>%
+  mutate(labels = factor(labels, levels = c("rod", "transitioning", "spore")))
+
+predicted_data <- cell_data %>%
+  data_grid(labels) %>%
+  add_predicted_draws(mv_shape_model, re_formula = NA) %>%
+  mutate(labels = factor(labels, levels = c("rod", "transitioning", "spore")))
+```
+
+Figure Supplemental 5A --  Equivalent diameter
+```{r}
+(equiv_diameter_plt <- ggplot(cell_data) +
+   geom_sina(aes(x = labels, y = log_equiv_diameter_um %>% exp()), col = "gray") +
+   labs(x = "", y = expression(Equiv.~diameter~(μm))) +
+   theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./sfig/sfig5A_equiv_diameter_violin.png", equiv_diameter_plt, width = 4, height = 3, dpi = 300)
+
+(ed_validation <- ggplot(fitted_data %>%filter(.category == "logequivdiameterum")) +
+    geom_sina(data = cell_data, aes(x = labels, y = log_equiv_diameter_um %>% exp()), col = "gray") +
+    stat_pointinterval(aes(x = labels, y = .value %>% exp), point_interval = median_hdci, .width = 0.90) +
+    scale_x_discrete(limits = c("rod", "transitioning", "spore")) +
+    labs(x = "", y = expression(Equiv.~diameter~(μm))) +
+    theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./sfig/sfig5A_equiv_diameter_validation.png", width = 4, height = 3, dpi = 300)
+
+(ed_contrast <- fitted_data %>% 
+    filter(.category == "logequivdiameterum") %>%
+    mutate(exp_value = exp(.value)) %>%
+    compare_levels(variable = exp_value, by = labels, comparison = list(c("rod", "transitioning"),
+                                                                        c("transitioning", "spore"),
+                                                                        c("rod", "spore"))) %>%
+    ggplot() +
+    stat_pointinterval(aes(y = labels, x = exp_value),point_interval = median_hdci, alpha = 0.90) +
+    scale_y_discrete(limits = c("rod - transitioning", "transitioning - spore", "rod - spore")) +
+    geom_vline(xintercept = 0, linetype = 2) + 
+    labs(x = expression(Δ~equiv.~diameter~(μm)), y = "") +
+    theme(text = element_text(size = 14), axis.text = element_text(size = 11)))
+# ggsave("./sfig/sfig5A_equiv_diameter_contrast.png", ed_contrast, width = 4, height = 3, dpi = 300)
+
+(sfig5A_pair_plot <- plot_grid(plotlist = list(ed_validation, ed_contrast)))
+```
+
+Figure Supplemental 5B -- Length
+```{r}
+(length_plt <- ggplot(cell_data) +
+   geom_sina(aes(x = labels, y = log_length_um %>% exp), col = "gray", size = 0.5) + 
+   scale_x_discrete(limits = c("rod", "transitioning", "spore")) + 
+   labs(x = "", y = expression(Cell~length~(μm))) +
+   theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./sfig/sfig5B_length_violin.png", length_plt, width = 4, height = 3, dpi = 300)
+
+(length_validation <- ggplot(fitted_data %>%filter(.category == "loglengthum")) +
+    geom_sina(data = cell_data, aes(x = labels, y = log_length_um %>% exp), col = "gray", size = 0.5) + 
+    stat_pointinterval(aes(x = labels, y = .value %>% exp), point_interval = median_hdci, alpha = 0.90) +
+    labs(x = "", y = expression(Cell~length~(μm))) +
+    theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./sfig/sfig5B_length_validation.png", length_validation, width = 4, height = 3, dpi = 300)
+
+(length_contrast <- fitted_data %>% 
+    filter(.category == "loglengthum") %>%
+    mutate(exp_value = exp(.value)) %>%
+    compare_levels(variable = exp_value, by = labels, comparison = list(c("rod", "transitioning"),
+                                                                        c("transitioning", "spore"),
+                                                                        c("rod", "spore"))) %>%
+    ggplot() +
+    stat_pointinterval(aes(x = exp_value, y = labels), point_interval = median_hdci, .width = c(0.90, 0.98), point_size = 1) +
+    scale_y_discrete(limits = c("rod - transitioning", "transitioning - spore", "rod - spore")) +
+    geom_vline(xintercept = 0, linetype = 2) + 
+    labs(x = expression(Δ~length~(μm)), y = "") +
+    theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./sfig/sfig5B_length_contrast.png", length_contrast, width = 4, height = 3, dpi = 300)
+
+(sfig5B_pair_plot <- plot_grid(plotlist = list(length_validation, length_contrast)))
+```
+
+Figure Supplemental 5C -- Mean width
+```{r}
+(mean_width_plt <- ggplot(cell_data) +
+   geom_sina(aes(x = labels, y = log_mean_width_um %>% exp), col = "gray") + 
+   scale_x_discrete(limits = c("rod", "transitioning", "spore")) + 
+   labs(x = "", y = expression(Mean~cell~width~(μm))) +
+   theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./sfig/sfig5C_mean_width_violin.png", mean_width_plt, width = 4, height = 3, dpi = 300)
+
+(mean_width_validation <- ggplot(fitted_data %>%filter(.category == "logmeanwidthum")) +
+    geom_sina(data = cell_data, aes(x = labels, y = log_mean_width_um %>% exp), col = "gray") +
+    stat_pointinterval(aes(x = labels, y = .value %>% exp), point_interval = median_hdci, alpha = 0.90) +
+    scale_x_discrete(limits = c("rod", "transitioning", "spore")) +
+    labs(x = "", y = expression(Mean~cell~width~(μm))) +
+    theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./sfig/sfig5C_mean_width_validation.png", mean_width_validation, width = 4, height = 3, dpi = 300)
+
+(mean_width_contrast <- fitted_data %>% 
+    filter(.category == "logmeanwidthum") %>%
+    mutate(exp_value = exp(.value)) %>%
+    compare_levels(variable = exp_value, by = labels, comparison = list(c("rod", "transitioning"),
+                                                                        c("transitioning", "spore"),
+                                                                        c("rod", "spore"))) %>%
+    ggplot() +
+    stat_pointinterval(aes(x = exp_value, y = labels), point_interval = median_hdci, .width = c(0.90, 0.98), point_size = 1) +
+    scale_y_discrete(limits = c("rod - transitioning", "transitioning - spore", "rod - spore")) +
+    geom_vline(xintercept = 0, linetype = 2) + 
+    labs(x = expression(Δ~mean~width~(μm)), y = "") +
+    theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./sfig/sfig5C_mean_width_contrast.png", mean_width_contrast, width = 4, height = 3, dpi = 300)
+
+(sfig5C_pair_plot <- plot_grid(plotlist = list(mean_width_validation, mean_width_contrast)))
+```
+
+Figure Supplemental 5D -- Sphericity
+```{r}
+(sphericity_plt <- ggplot(cell_data) +
+   geom_sina(aes(x = labels, y = sphericity), col = "gray") + 
+   scale_x_discrete(limits = c("rod", "transitioning", "spore")) + 
+   labs(x = "", y = expression(Sphericity)) +
+   theme(text = element_text(size = 14), axis.text = element_text(size = 12)) +
+   scale_y_continuous(breaks = seq(0.4, 1, 0.2)))
+# ggsave("./sfig/sfig5D_sphericity_violin.png", sphericity_plt, width = 4, height = 3, dpi = 300)
+
+(sphericity_validation <- ggplot(fitted_data %>% filter(.category == "sphericity")) +
+    geom_sina(data = cell_data, aes(x = labels, y = sphericity, col = body_id), size = 0.5, col = "gray") +
+    stat_pointinterval(aes(x = labels, y = .value), point_interval = median_hdci, alpha = 0.90) +
+    labs(x = "", y = expression(Sphericity)) +
+    theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./fig2/sfig5D_sphericity_validation.png", sphericity_validation, width = 4, height = 3, dpi = 300)
+
+(sphericity_contrast <- fitted_data %>% 
+    filter(.category == "sphericity") %>%
+    mutate(exp_value = .value) %>%
+    compare_levels(variable = exp_value, by = labels, comparison = list(c("rod", "transitioning"),
+                                                                        c("transitioning", "spore"),
+                                                                        c("rod", "spore"))) %>%
+    ggplot() +
+    stat_pointinterval(aes(x = exp_value, y = labels), point_interval = median_hdci, .width = c(0.90, 0.98), point_size = 1) +
+    scale_y_discrete(limits = c("rod - transitioning", "transitioning - spore", "rod - spore")) +
+    geom_vline(xintercept = 0, linetype = 2) + 
+    labs(x = expression(Δ~sphericity), y = "") +
+    theme(text = element_text(size = 14), axis.text = element_text(size = 12)))
+# ggsave("./fig2/sfig5D_sphericity_contrast.png", sphericity_contrast, width = 4, height = 3, dpi = 300)
+
+(sfig5D_pair_plot <- plot_grid(plotlist = list(sphericity_validation, sphericity_contrast)))
+```
+
+Figure Supplemental 5 -- Generate final plot
+```{r}
+(all_sfig5_plots_full <- plot_grid(plotlist = list(ed_validation, ed_contrast,
+                                                   length_validation, length_contrast,
+                                                   mean_width_validation, mean_width_contrast,
+                                                   sphericity_validation, sphericity_contrast),
+                                   ncol = 2, 
+                                   labels = c("A", "", "B", "", "C", "", "D", ""),
+                                   label_x = 0.17,
+                                   align = "hv",
+                                   axis = "ltbr",
+                                   rel_widths = c(1, 1)))
+
+ggsave("./figure_supplemental/figure_supplemental_5.png", plot = all_sfig5_plots_full, width = 10, height = 10, bg = "white")
+```
+
+Supplementary Figure 5 -- Hypothesis tests
+```{r}
+(sfig5_hypothesis <- hypothesis(x = mv_shape_model, c("sphericity_labelsspore > sphericity_labelsrod",
+                                                      "sphericity_labelstransitioning > sphericity_labelsrod",
+                                                      "sphericity_labelsspore > sphericity_labelstransitioning",
+                                                      "logequivdiameterum_labelsrod > logequivdiameterum_labelsspore",
+                                                      "logequivdiameterum_labelstransitioning > logequivdiameterum_labelsspore",
+                                                      "logequivdiameterum_labelsrod > logequivdiameterum_labelstransitioning",
+                                                      "loglengthum_labelsrod > loglengthum_labelsspore",
+                                                      "loglengthum_labelstransitioning > loglengthum_labelsspore",
+                                                      "loglengthum_labelsrod > loglengthum_labelstransitioning",
+                                                      "logmeanwidthum_labelsrod < logmeanwidthum_labelsspore",
+                                                      "logmeanwidthum_labelstransitioning < logmeanwidthum_labelsspore",
+                                                      "logmeanwidthum_labelsrod < logmeanwidthum_labelstransitioning")))
+write_csv(sfig5_hypothesis$hypothesis, "./csv/hypothesis/figure_supplemental_5_contrast_hypotheses.csv")
+```
+
+
+
+Figure Supplemental 6 -- Spatiotemporal distributions of cell classes and density
+Merge radial proportions of individual bodies (includes body effect)
+```{r}
+merge_radial_prop <- function(filepath, name) {
+  print(str_glue("Loading {filepath}"))
+  fit <- read_rds(filepath)
+  
+  model_out <- data_grid(data = fit$data, r = seq(0, 60, 1), body_id, dummy = 1) %>%
+    add_fitted_draws(fit, n = 4000) %>%
+    mutate(body_id = body_id,
+           name = name,
+           time_point = str_extract(name, "\\d{2}h"))
+  
+  return(model_out)
+}
+
+all_models <- map_df(list.files("./rds/model_rds/radius_label", pattern = ".*\\.rds", full.names = T),
+                     ~ merge_radial_prop(.x, str_extract(.x, "(?<=/)[A-Za-z_0-9\\.]*(?=\\.rds$)")))
+
+write_rds(all_models, "./rds/model_rds/merged_radial_proportions_individual_bodies.rds", compress = "gz")
+```
+
+Figure Supplemental 6 -- Spatiotemporal distributions of cell classes and density
+Merge radial densities of individual bodies
+```{r}
+merge_radial_density <- function(filepath, name) {
+  #browser()
+  print(str_glue("Loading {filepath}"))
+  fit <- read_rds(filepath)
+  
+  data_grid(data = fit$data, left_pt = seq(0, 60, 1), body_id, dummy = 1) %>%
+    add_fitted_draws(fit, n = 4000) %>%
+    mutate(body_id = body_id,
+           name = name,
+           time_point = str_extract(name, "\\d{2}h"))
+}
+
+all_models <- map_df(list.files("./rds/model_rds/radius_density",
+                                pattern = ".*\\.rds", full.names = T),
+                     ~ merge_radial_density(.x, str_extract(.x, "(?<=/)[A-Za-z_0-9\\.]*(?=\\.rds$)")))
+
+write_rds(all_models, "./rds/model_rds/merged_density_models_radius_individual_bodies.rds", compress = "gz")
+```
+
+Figure Supplemental 6 -- Spatiotemporal distributions of cell classes and density
+Final merge and render plot
+```{r}
+all_models <- read_rds("./rds/model_rds/merged_radial_proportions_individual_bodies.rds") %>%
+  mutate(label = str_extract(.category, "(rod|transitioning|spore)"),
+         label = factor(label, levels = c("rod", "transitioning", "spore")),
+         time_point = str_replace(time_point, "h", " h"))
+
+all_densities_data <- read_rds("./rds/model_rds/merged_density_models_radius_individual_bodies.rds") %>%
+  group_by(body_id, time_point, left_pt) %>%
+  mutate(left_pt_90 = quantile(.value, 0.90), left_pt_10 = quantile(.value, 0.1)) %>%
+  ungroup() %>%
+  group_by(body_id, time_point)
+
+all_densities <- all_densities_data %>%
+  mutate(scaled_estimate = (.value - min(left_pt_10)) / (max(left_pt_90) - min(left_pt_10)),
+         time_point = str_replace(time_point, "h", " h"))
+
+(radial_proportion_plot <- ggplot(all_models) +
+    stat_lineribbon(aes(x = r, y = .value, col = label, fill = label), .width = 0.90, alpha = 0.333, point_interval = median_hdci) +
+    stat_lineribbon(data = all_densities, aes(x = left_pt, y = scaled_estimate),
+                    fill = 'darkgray', col = 'black', .width = 0.90, point_interval = median_hdci, alpha = 0.333) +
+    labs(x = "Distance from center (μm)",
+         y = "Proportion/Norm. Density",
+         col = "", fill = "") +
+    coord_cartesian(ylim = c(0, 1)) +
+    facet_grid(body_id ~ time_point)+
+    theme(text = element_text(size = 18),
+          axis.text = element_text(size = 16),
+          strip.text.x = element_text(size = 16),
+          legend.position = "top") +
+    guides(fill = "none") +
+    scale_fill_manual(values = c("rod" = "#f8766d", "transitioning" = "#00ba38", "spore" = "#83b0fc", "0.9" = "darkgrey")))
+
+ggsave("./figure_supplemental/figure_supplemental_6_radial_proportions_model.png", plot = radial_proportion_plot, width = 10, height = 20, bg = "white")
+
+body_lut <- list("body_03" = "YH8", "body_15" = "YH7", "body_21" = "YH14", "body_24" = "YH15")
+
+all_models <- all_models %>%
+  filter(body_id %in% c("body_03", "body_15", "body_21", "body_24")) %>%
+  mutate(body_renamed = body_lut[body_id] %>% unlist() %>% factor(levels = c("YH8", "YH7", "YH14", "YH15")))
+
+all_densities <- all_densities %>%
+  filter(body_id %in% c("body_03", "body_15", "body_21", "body_24")) %>%
+  mutate(body_renamed = body_lut[body_id] %>% unlist() %>% factor(levels = c("YH8", "YH7", "YH14", "YH15")))
+
+(radial_proportion_plot_picked <- ggplot(all_models) +
+    stat_lineribbon(aes(x = r, y = .value, col = label, fill = label), .width = 0.90, alpha = 0.333, point_interval = median_hdci) +
+    stat_lineribbon(data = all_densities, aes(x = left_pt, y = scaled_estimate),
+                    fill = 'darkgray', col = 'black', .width = 0.90, point_interval = median_hdci, alpha = 0.333) +
+    labs(x = "Distance from center (μm)",
+         y = "Proportion/Norm. Density",
+         col = "", fill = "") +
+    facet_grid(body_renamed ~ time_point) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme(text = element_text(size = 18),
+          axis.text = element_text(size = 16),
+          strip.text.x = element_text(size = 16),
+          legend.position = "top") +
+    guides(fill = "none") +
+    scale_fill_manual(values = c("rod" = "#f8766d", "transitioning" = "#00ba38", "spore" = "#83b0fc", "0.9" = "darkgrey")))
+
+ggsave("./figure_supplemental/figure_supplemental_6_radial_proportions_model_selected.png", plot = radial_proportion_plot_picked, width = 10, height = 8, bg = "white")
+```
+
+
+
+Figure Supplemental 8A -- Fluorescence cutoffs
+```{r}
+cell_data_expr <- read_rds("./rds/myxo_data.rds") %>%
+  ungroup() %>%
+  filter(labels != "debris", body_id %in% c("body_19", "body_20", "body_21",
+                                            "body_22", "body_23", "body_24"), time_point != "24h") %>%
+  group_by(body_id, time_point) %>%
+  mutate(promoter = ifelse(body_id %in% c("body_19", "body_20", "body_21"), "dev", "fmgE")) %>%
+  mutate(ch1_mean_log = MeanIntensity %>% log10,
+         ch2_mean_log = channel_2_MeanIntensity %>% log10,
+         time_point = str_replace(time_point, "h", " h")) %>%
+  ungroup()
+
+(fluor_scatter_pre <- ggplot(cell_data_expr) +
+    geom_jitter(aes(x = ch1_mean_log, y = ch2_mean_log, col = labels_factor), alpha = 0.5, size = 0.5) +
+    facet_grid(promoter ~ time_point) +
+    geom_vline(xintercept = log10(50)) +
+    geom_hline(yintercept = log10(100)) +
+    labs(x = "log10 channel 1 mean", y = "log10 channel 2 mean", col = "") +
+    theme(text = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          strip.text = element_text(size = 20),
+          strip.text.y = element_text(size = 20, face = "italic"),
+          legend.position = "top") +
+    scale_x_continuous(breaks = seq(0, 3, 1), limits = c(0, 3)) +
+    scale_y_continuous(breaks = seq(0, 3, 1), limits = c(0, 3.5)) +
+    guides(color = guide_legend(override.aes = list(size = 2))) + 
+    labs(x = expression(log[10](green~fluorescent~intensity)),
+         y = expression(log[10](red~fluorescent~intensity)),
+         col = ""))
+ggsave(filename = "./figure_supplemental/figure_supplemental_8A_fluor_scatter_pre_cutoff.png", fluor_scatter_pre, width = 8, height = 5, bg = "white")
+
+cell_data_expr_post <- cell_data_expr %>%
+  filter((ch1_mean_log > log10(50) | ch2_mean_log > log10(100)))
+
+(fluor_scatter_post <- ggplot(cell_data_expr_post) +
+    geom_jitter(aes(x = ch1_mean_log, y = ch2_mean_log, col = labels_factor), alpha = 0.5, size = 0.5) +
+    facet_grid(promoter ~ time_point) +
+    geom_vline(xintercept = log10(50)) +
+    geom_hline(yintercept = log10(100)) +
+    labs(x = "log10 channel 1 mean", y = "log10 channel 2 mean", col = "") +
+    theme(text = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          strip.text = element_text(size = 20),
+          strip.text.y = element_text(size = 20, face = "italic"),
+          legend.position = "top") +
+    scale_x_continuous(breaks = seq(0, 3, 1), limits = c(0, 3)) +
+    scale_y_continuous(breaks = seq(0, 3, 1), limits = c(0, 3.5)) +
+    guides(color = guide_legend(override.aes = list(size = 2)))+ 
+    labs(x = expression(log[10](green~fluorescent~intensity)),
+         y = expression(log[10](red~fluorescent~intensity)),
+         col = ""))
+ggsave(filename = "./figure_supplemental/figure_supplemental_8A_fluor_scatter_post_cutoff.png", fluor_scatter_post, width = 8, height = 5, bg = "white")
+```
+
+Supplementary Figure 8BCD -- C-signal dependent gene expression fluorescence
+```{r}
+cells_dist <- read_rds("./rds/myxo_data.rds") %>%
+  filter(body_id %in% c("body_19", "body_20", "body_21", "body_22", "body_23", "body_24")) %>%
+  mutate(promoter = ifelse(body_id %in% c("body_19", "body_20", "body_21"), "dev", "fmgE"),
+         ch1_mean_log = MeanIntensity %>% log10(),
+         ch2_mean_log = channel_2_MeanIntensity %>% log10(),
+         relative_signal = ch2_mean_log - ch1_mean_log,
+         logsub = ch2_mean_log - ch1_mean_log) %>%
+  filter((ch1_mean_log > log10(50) | ch2_mean_log > log10(100))) %>%
+  mutate(promoter_by_time = str_c(promoter, time_point %>% as.character(), sep = "."),
+         time_point_str = str_replace(time_point, "h", " h"),
+         dummy = as.numeric(1.0))
+
+(red_fluor <- ggplot(cells_dist) +
+    geom_sina(aes(x = time_point, y = ch2_mean_log, col = labels_factor), size = 0.5) +
+    stat_summary(aes(x = time_point, y = ch2_mean_log, col = labels_factor, group = labels_factor),
+                 fun = median, geom = "point", col = "black", position = position_dodge(width = 0.95), shape = "-", size = 10) +
+    facet_wrap(.~promoter) +
+    labs(x = expression(Hours~PS),
+         y = expression(log[10](red~fluorescent~intensity)),
+         col = "") +
+    scale_x_discrete(labels = c("27", "30", "36", "48")) +
+    theme(text = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          strip.text = element_text(size = 20, face = "italic"),
+          legend.position = "top") +
+    guides(color = guide_legend(override.aes = list(size = 2))))
+ggsave(red_fluor, filename = "./figure_supplemental/figure_supplemental_8B_red_absolute.png", width = 8, height = 4.8, dpi = 300, bg = "white")
+
+(green_fluor <- ggplot(cells_dist) +
+    geom_sina(aes(x = time_point, y = ch1_mean_log, col = labels_factor), size = 0.5) +
+    stat_summary(aes(x = time_point, y = ch1_mean_log, col = labels_factor, group = labels_factor),
+                 fun = median, geom = "point", col = "black", position = position_dodge(width = 0.95), shape = "-", size = 10) + 
+    facet_wrap(.~promoter) +
+    labs(x = expression(Hours~PS),
+         y = expression(log[10](green~fluorescent~intensity)),
+         col = "") +
+    scale_x_discrete(labels = c("27", "30", "36", "48")) +
+    theme(text = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          strip.text = element_text(size = 20, face = "italic"),
+          legend.position = "top") +
+    guides(color = guide_legend(override.aes = list(size = 2))))
+ggsave(green_fluor, filename = "./figure_supplemental/figure_supplemental_8C_green_absolute.png", width = 8, height = 4.8, dpi = 300, bg = "white")
+
+(relative_fluor <- ggplot(cells_dist) +
+    geom_sina(aes(x = time_point, y = relative_signal, col = labels_factor), size = 0.5) +
+    stat_summary(aes(x = time_point, y = relative_signal, col = labels_factor, group = labels_factor),
+                 fun = median, geom = "point", col = "black", position = position_dodge(width = 0.95), shape = "-", size = 12) +
+    facet_wrap(.~promoter) +
+    labs(x = expression(Hours~PS),
+         y = expression(log[10](relative~fluorescent~intensity)),
+         col = "") +
+    scale_x_discrete(labels = c("27", "30", "36", "48")) +
+    theme(text = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          strip.text = element_text(size = 20, face = "italic"),
+          legend.position = "top") +
+    guides(color = guide_legend(override.aes = list(size = 2))))
+ggsave(relative_fluor, filename = "./figure_supplemental/figure_supplemental_8D_relative_fluor.png", width = 8, height = 4.8, dpi = 300, bg = "white")
+```
+
+
+
+Figure Supplemental 9 -- Vanillate inducible gene expression
+```{r}
+cells <- read_rds("./rds/myxo_data.rds") %>%
+  ungroup() %>%
+  filter(labels != "debris", body_id %in% c("body_13", "body_14", "body_15",
+                                            "body_16", "body_17", "body_18"), time_point != "24h") %>%
+  group_by(body_id, time_point) %>%
+  mutate(label_time = str_c(labels, time_point)) %>%
+  mutate(promoter = ifelse(body_id %in% c("body_13", "body_14", "body_15"), "mNeonGreen", "tdTomato")) %>%
+  mutate(ch1_mean = MeanIntensity)
+
+(absolute_fluor <- ggplot(cells) +
+    geom_sina(aes(x = time_point, y = ch1_mean %>% log10(), col = labels_factor), size = 0.5) +
+    facet_wrap(.~promoter) +
+    labs(x = expression(Hours~PS), y = expression(log[10](fluorescent~intensity)), col = "") +
+    scale_x_discrete(labels = c("27", "30", "36", "48")) +
+    stat_summary(aes(x = time_point, y = ch1_mean %>% log10(), col = labels_factor, group = labels_factor),
+                 fun = median, geom = "point", col = "black", position = position_dodge(width = 0.95), shape = "-", size = 12) +
+    facet_wrap(.~promoter) +
+    theme(text = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          strip.text = element_text(size = 20, face = "italic")) +
+    guides(color = guide_legend(override.aes = list(size = 2))))
+ggsave(absolute_fluor, filename = "./figure_supplemental/figure_supplemental_9_pvan_intensity.png", width = 8, height = 5, bg = "white")
+```

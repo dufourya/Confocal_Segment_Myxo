@@ -1,0 +1,752 @@
+---
+title: "Myxo notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(mclust)
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(cowplot)
+library(ggforce)
+library(mgcv)
+library(modelr)
+library(GGally)
+theme_set(theme_cowplot())
+
+library(furrr)
+plan(multiprocess(workers = 3)) # More cores is faster, but some of these future_maps require a ton of memory per core.
+
+current_script_dir <- dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(current_script_dir)
+```
+
+Load data from CSV files, clean, and save as an RDS file. If rerun, check clusters.
+```{r}
+load_file <- function(path) {
+  read_csv(path, col_types = cols()) %>%
+    mutate(file_name = str_extract(string = path, pattern = "[a-zA-z0-9_]*\\.txt"))
+}
+
+load_dir <- function(dir) {
+  file_list <- list.files(path = dir, pattern = "*.txt", full.names = T)
+  map_df(file_list, load_file)
+}
+
+myxo_data <- load_dir("./csv/raw_data") %>%
+  mutate(time_point = str_remove_all(str_extract(file_name, "_\\d\\dh_"),'_'), body_id = str_extract(file_name, "body_\\d+")) %>%
+  filter(sphericity <= 1) %>%
+  mutate(z_dist = WeightedCentroid_3 * 0.2,
+         z_dist = ifelse(body_id == "body_3" & time_point == "30h", z_dist - 0.5, z_dist)) %>% # body_3 @ 30h is shifted relative to the others.
+  filter(nb_branch_pt == 0, z_dist > 1,  z_dist < 9.5) %>%
+  mutate(z_dist = ifelse(!(body_id %in% c("body_1", "body_2", "body_3")) & (z_dist > 4.5), NA, z_dist)) %>%
+  filter(!is.na(z_dist))
+
+# Reclustering. Don't re-run this unless necessary, or you'll have to re-determine the classification labels.
+#
+# myxo_data_subset <- myxo_data %>%
+#   select(EquivDiameter, SurfaceArea, SkeletonSize, MeanWidth, time_point) %>%
+#   mutate(logEquivDiameter = log(EquivDiameter),
+#          sqrtSurfaceArea = sqrt(SurfaceArea),
+#          logSqrtSurfaceArea = log(sqrtSurfaceArea),
+#          logSkeletonSize = log(SkeletonSize),
+#          logMeanWidth = log(MeanWidth)) %>%
+#   select(-EquivDiameter, -SurfaceArea, -SkeletonSize, -MeanWidth, -sqrtSurfaceArea)
+# myxo_clust <- myxo_data_subset %>%
+#   select(-time_point) %>%
+#   densityMclust(G = 4)
+# write_rds(myxo_clust, './rds/mclust_model.rds', compress = 'gz')
+#
+# Determine the classification
+# ggplot(myxo_data) +
+#    geom_point(aes(x = EquivDiameter %>% log, y = sphericity, col = classification), alpha = 0.75) +
+#   facet_grid(. ~ time_point)
+
+myxo_data_subset <- myxo_data %>%
+  select(EquivDiameter, SurfaceArea, SkeletonSize, MeanWidth, time_point) %>%
+  mutate(logEquivDiameter = log(EquivDiameter),
+         sqrtSurfaceArea = sqrt(SurfaceArea),
+         logSqrtSurfaceArea = log(sqrtSurfaceArea),
+         logSkeletonSize = log(SkeletonSize),
+         logMeanWidth = log(MeanWidth)) %>%
+  select(-EquivDiameter, -SurfaceArea, -SkeletonSize, -MeanWidth, -sqrtSurfaceArea, -time_point)
+
+mapping <- list("1" = "debris", "2" = "spore", "3" = "transitioning", "4" = "rod")
+clust_model <- read_rds('./rds/mclust_model.rds')
+pred <- predict.Mclust(clust_model, myxo_data_subset)
+
+myxo_data <- myxo_data %>%
+  ungroup() %>%
+  mutate(classification = pred$classification %>% as.factor(),
+         labels = mapping[classification %>% as.character()] %>% unlist(),
+         body_id = str_replace(body_id, "_(?=\\d$)", "_0"))
+
+myxo_data <- myxo_data %>%
+  group_by(body_id, time_point) %>%
+  filter(labels != "debris") %>%
+  mutate(labels_factor = factor(labels, levels = c("rod", "transitioning", "spore")),
+         label_time = str_c(labels, time_point),
+         dist_from_center = sqrt((WeightedCentroid_1 - mean(WeightedCentroid_1))^2 + (WeightedCentroid_2 - mean(WeightedCentroid_2))^2) * 0.1240,
+         z_dist = WeightedCentroid_3 * 0.2)
+
+write_rds(myxo_data, './rds/myxo_data.rds', compress = 'gz')
+write_csv(myxo_data, './csv/myxo_data.csv')
+```
+
+Tables of cell counts per fruiting body, time point, etc.
+```{r}
+myxo_data <- read_rds("./rds/myxo_data.rds")
+
+(counts <- myxo_data %>%
+    ungroup() %>%
+    group_by(body_id) %>%
+    summarise(num_cells = n()))
+
+write_csv(counts, "./csv/cell_counts_by_body_id.csv")
+
+(counts_body_tp <- myxo_data %>%
+    ungroup() %>%
+    group_by(body_id, time_point) %>%
+    summarise(num_cells = n()))
+
+write_csv(counts_body_tp, "./csv/cell_counts_by_body_id_by_time_point.csv")
+
+(counts_cell_type <- myxo_data %>%
+    ungroup() %>%
+    group_by(labels_factor) %>% 
+    summarise(num_cells = n()))
+
+write_csv(counts_cell_type, "./csv/cell_counts_by_body_cell_type.csv")
+```
+
+
+Figure 2D -- Cell type proportions over time
+```{r}
+cell_data_proportions <- read_rds("./rds/myxo_data.rds") %>%
+  ungroup() %>%
+  group_by(body_id, time_point, labels_factor) %>%
+  summarize(n = n(), .groups = "drop_last") %>%
+  mutate(total = sum(n)) %>%
+  pivot_wider(names_from = labels_factor, values_from = n) %>%
+  mutate(time_point = ordered(time_point, levels = c("27h", "30h", "36h", "48h")))
+
+cell_data_proportions$count_vec <- with(cell_data_proportions, cbind(rod, transitioning, spore))
+
+prop_model_path <- "./rds/model_rds/body_prop_model_all_bodies.rds"
+prop_fn <- bf(count_vec | trials(total) ~ mo(time_point) + (mo(time_point) | body_id),
+              muspore ~ mo(time_point) + (mo(time_point) | body_id),
+              mutransitioning ~ mo(time_point) + (mo(time_point) | body_id),
+              family = multinomial())
+
+prop_model <- brm(prop_fn, data = cell_data_proportions, chains = 4, cores = 4,
+                    warmup = 500, iter = 1500,
+                    control = list("adapt_delta" = 0.99, "metric" = "diag_e", "max_treedepth" = 15))
+
+write_rds(prop_model, prop_model_path, compress = "gz")
+
+prop_model <- read_rds(prop_model_path)
+
+n_total <- 1000
+
+pred_by_body <- data_grid(cell_data_proportions, time_point, total = n_total) %>%
+  add_fitted_draws(model = prop_model, re_formula = NA, summary = T, n = 4000) %>%
+  mutate(time_point_numeric = time_point %>% str_extract("\\d\\d") %>% as.numeric,
+         .value = .value/n_total)
+
+(prop_model_all_bodies <- ggplot(pred_by_body) +
+    stat_interval(aes(x = time_point_numeric, y = .value, group = .category, col = .category), point_interval = median_hdci, .width = c(0.90), alpha = 0.25, size = 7) +
+    stat_summary(aes(x = time_point_numeric, y = .value, group = .category, col = .category), fun = median, geom = "point", size = 3) +
+    labs(x = "Hours PS", y = "Proportion", col = "", fill = "") +
+    theme(text = element_text(size = 18), axis.text = element_text(size = 18),
+          strip.text.x = element_text(size = 18), legend.text = element_text(size = 18), legend.position = "top"))
+
+ggsave("./figure_2/figure_2D_proportions_model_all_bodies.png", plot = prop_model_all_bodies, width = 6, height = 4, dpi = 300, bg = "white")
+```
+
+
+
+Figure 3A -- Radial distribution of cell classifications
+Run radial density models
+```{r}
+cells_dist <- read_rds("./rds/myxo_data.rds") %>%
+  filter(dist_from_center < 60)
+
+const_area_annuli <- function(lb, ub, target_area) {
+  r <- 0
+  slice_vec <- c() 
+  while (r < ub) {
+    slice_vec <- c(slice_vec, r)
+    r <- sqrt((target_area / pi) + r^2)
+  }
+  slice_vec
+}
+
+fitting_data <- tibble(r = cells_dist$dist_from_center,
+                       label = cells_dist$labels,
+                       body_id = cells_dist$body_id,
+                       time_point = cells_dist$time_point,
+                       dummy = 1)
+
+gam_density <- function(filtered_data, label_str) {
+  print(str_glue("Fitting density GAM to: {label_str}"))
+
+  cell_counts_by_body <- filtered_data %>%
+    group_by(body_id) %>%
+    summarise(n = n())
+  
+  fd <- filtered_data %>%
+    mutate(bin = cut(r, const_area_annuli(0, 65, (pi*65^2) / 20))) %>%
+    group_by(body_id, bin) %>%
+    summarise(n = n()) %>%
+    mutate(left_pt = str_extract(bin %>% as.character, "\\d+(\\.\\d+)?(?=\\,)") %>% as.numeric,
+           tot = map_dbl(body_id, ~filter(cell_counts_by_body, body_id == .x)$n),
+           prop = n / tot,
+           dummy = 1)
+  
+  (raw_points <- ggplot(fd) +
+      geom_point(aes(x = left_pt, y = prop, col = body_id)) +
+      geom_smooth(aes(x = left_pt, y = prop)))
+  ggsave(filename = str_glue("./val/radial_density_smooth_{label_str}.png"), raw_points, width = 8, height = 6)
+  
+  formula <- bf(prop ~ t2(left_pt) + t2(left_pt, body_id, dummy, bs = 're'), family = Beta)
+  
+  fit <- brm(formula, data = fd, chains = 8, cores = 8, inits = 0, warmup = 250,
+             iter = 5250, control = list("adapt_delta" = 0.999, max_treedepth = 14))
+  
+  write_rds(fit, path = str_glue("./rds/model_rds/radius_density/{label_str}.rds"), compress = "gz")
+}
+
+walk(list("27h", "30h", "36h", "48h"), ~filter(fitting_data, time_point == .x) %>% gam_density(str_glue("gam_density_{.x}")))
+```
+
+Figure 3A -- Radial distribution of cell classifications
+Merge radial density models
+```{r}
+merge_radial_density <- function(filepath, name, run_all_body_ids = FALSE) {
+  print(str_glue("Loading radial density model {filepath}"))
+  fit <- read_rds(filepath)
+  
+  if (!run_all_body_ids) {
+    body_ids = "body_01"
+    dummy_val = 0
+  } else {
+    body_ids = unique(fit$data$body_id)
+    dummy_val = 1
+  }
+  
+  map_df(body_ids, function(bid) {
+    pred_body <- data_grid(fit$data, left_pt = seq(0, 60, 0.2), body_id = bid, dummy = dummy_val) %>%
+      add_fitted_draws(fit, n = 1000) %>%
+      mutate(time_point = str_extract(name, "\\d\\dh"))
+    return(pred_body)
+  })
+}
+
+filename_regex <- "(?<=/)[A-Za-z_0-9\\.]*(?=\\.rds$)"
+
+nobody_density_models <- map_df(list.files("./rds/model_rds/radius_density", pattern = ".*\\.rds", full.names = T),
+                                ~ merge_radial_density(.x, str_extract(.x, filename_regex), FALSE))
+write_rds(nobody_density_models, "./rds/model_rds/merged_density_models_radius_all_bodies.rds", compress = "gz")
+
+all_body_density_models <- map_df(list.files("./rds/model_rds/radius_density", pattern = ".*\\.rds", full.names = T),
+                                  ~ merge_radial_density(.x, str_extract(.x, filename_regex), TRUE))
+write_rds(all_body_density_models, "./rds/model_rds/merged_density_models_radius_individual_bodies.rds", compress = "gz")
+```
+
+Figure 3A -- Radial distribution of cell classifications
+Run radial proportions model
+```{r}
+cells_dist <- read_rds("./rds/myxo_data.rds")
+
+fitting_data <- tibble(r = cells_dist$dist_from_center,
+                       label = cells_dist$labels, 
+                       body_id = cells_dist$body_id,
+                       time_point = cells_dist$time_point,
+                       dummy = 1)
+
+gam_label <- function(filtered_data, label_str) {
+  print(str_glue("Fitting label GAM to: {label_str}"))
+  data <- filtered_data
+  data$i <- with(data, cbind(label=='rod', label=='spore', label=='transitioning')) * 1
+  colnames(data$i) <- c('rod','spore','transitioning')
+  
+  formula <- bf(i | trials(1) ~ 1,
+                muspore ~ t2(r) + t2(r, body_id, dummy, bs='re'), 
+                mutransitioning ~ t2(r) + t2(r, body_id, dummy, bs='re'),
+                family = multinomial())
+  
+  fit <- brm(formula, data = data, chains = 8, cores = 8, inits = 0, warmup = 250,
+             iter = 5250, control = list("adapt_delta" = 0.999, max_treedepth = 14))
+  
+  write_rds(fit, path = str_glue("./rds/model_rds/radius_label/{label_str}.rds"), compress = "gz")
+}
+
+walk(list("27h", "30h", "36h", "48h"), ~filter(fitting_data, time_point == .x) %>% gam_label(str_glue("gam_label_{.x}")))
+```
+
+Figure 3A -- Radial distribution of cell classifications
+Merge radial proportions of all bodies (no body effect)
+```{r}
+merge_radial_label <- function(filepath, name) {
+  print(str_glue("Loading radial label model {filepath}"))
+  fit <- read_rds(filepath)
+  
+  model_out <- data_grid(data = fit$data, r = seq(0, 60, 0.5), body_id = "body_01", dummy = 0) %>%
+    add_fitted_draws(fit, re_formula = NA, n = 4000) %>%
+    mutate(body_id = body_id,
+           name = name,
+           time_point = str_extract(name, "\\d{2}h"))
+  
+  return(model_out)
+}
+
+all_models <- map_df(list.files("./rds/model_rds/radius_label", pattern = ".*\\.rds", full.names = T),
+                     ~ merge_radial_label(.x, str_extract(.x, "(?<=/)[A-Za-z_0-9\\.]*(?=\\.rds$)")))
+
+write_rds(all_models, "./rds/model_rds/merged_radial_proportions_all_bodies.rds", compress = "gz")
+```
+
+Figure 3A -- Radial distribution of cell classifications
+Contrasts of radial distributions for hypotheses
+```{r}
+compare_radial_prop <- function(filepath, name, in_body_id) {
+  print(str_glue("Loading {filepath}"))
+  fit <- read_rds(filepath)
+  
+  # find point of maximal prob
+  props <- data_grid(fit$data, r = seq(1, 60, 1), body_id = in_body_id, dummy = 0) %>%
+    add_fitted_draws(fit, re_formula = NA, n = 4000)
+  
+  (validation_plot <- ggplot(props) +
+    stat_lineribbon(aes(x = r, y = .value, col = .category), fill = "gray") +
+    labs(x = "Distance from center", y = "Proportion"))
+  ggsave(filename = str_glue("./hypothesis/figure_3/val/{name}_max_prob_distances.png"), plot = validation_plot, width = 8, height = 5)
+  
+  r_vals <- props %>%
+    ungroup() %>%
+    group_by(.category, r) %>%
+    summarise(median_prob = median(.value)) 
+  
+  max_r <- map_df(c("rod", "transitioning", "spore"), function(label) {
+    props <- filter(r_vals, .category == label)
+    max_row <- which.max(props$median_prob)
+    props[max_row,]
+  })
+  
+  max_r %>%
+    mutate(metadata = name) %>%
+    write_csv(str_glue("./hypothesis/figure_3/maximum_radial_proportions/{name}_max_prob_distances.csv"))
+  
+  contrast <- pmap_dfr(max_r, function(...) {
+    ttt <- tibble(...)
+    td <- props %>%
+      filter(r %in% unique(c(1, ttt$r, 60))) %>%
+      compare_levels(variable = .value, by = r) %>%
+      filter(.category == ttt$.category) %>%
+      mutate(run_name = name)
+    
+    map_df(td$r %>% unique(), ~ hypothesis(filter(td, r == .x), c(".value > 0", ".value < 0"))$hypothesis %>% mutate(r_comparison = .x)) %>%
+      bind_cols(ttt) %>%
+      mutate(metadata = name) %>%
+      write_csv(str_glue("./hypothesis/figure_3/figure_3_{name}_{ttt$.category}_hypothesis.csv"))
+  }) %>%
+    mutate(name = name)
+  return(contrast)
+}
+
+all_contrasts <- map_df(list.files("./rds/model_rds/radius_label", pattern = ".*\\.rds", full.names = T),
+                        ~ compare_radial_prop(.x, str_extract(.x, "(?<=/)[A-Za-z_0-9\\.]*(?=\\.rds$)"), "body_01")) %>%
+  mutate(time_point = str_extract(name, "\\d\\d(?=h)"),
+         labels_factor = factor(.category, levels = c("rod", "transitioning", "spore")))
+```
+
+Figure 3A -- Radial distribution of cell classifications
+Merge radial proportions of all bodies (no body effect)
+```{r}
+all_models <- read_rds("./rds/model_rds/merged_radial_proportions_all_bodies.rds") %>%
+  mutate(label = factor(.category, levels = c("rod", "transitioning", "spore")),
+         label = factor(label, levels = c("rod", "transitioning", "spore")),
+         time_point = str_replace(time_point, "h", " h"))
+
+all_densities_data <- read_rds("./rds/model_rds/merged_density_models_radius_all_bodies.rds") %>%
+  group_by(time_point, left_pt) %>%
+  mutate(left_pt_90 = quantile(.value, 0.90), left_pt_10 = quantile(.value, 0.1)) %>%
+  ungroup() %>%
+  group_by(time_point)
+
+all_densities <- all_densities_data %>%
+  mutate(scaled_estimate = (.value - min(left_pt_10)) / (max(left_pt_90) - min(left_pt_10)),
+         time_point = str_replace(time_point, "h", " h"))
+
+(radial_proportion_plot <- ggplot(all_models) +
+    stat_lineribbon(aes(x = r, y = .value, col = label, fill = label), .width = 0.90, alpha = 0.5, point_interval = median_hdci) +
+    stat_lineribbon(data = all_densities, aes(x = left_pt, y = scaled_estimate, col = "density"),
+                    fill = "darkgray", .width = 0.90, point_interval = median_hdci, alpha = 0.5) +
+    labs(x = "Distance from center (μm)",
+         y = "Proportion/Norm. Density",
+         col = "", fill = "") +
+    coord_cartesian(ylim = c(0, 1)) +
+    facet_grid(. ~ time_point) +
+    guides(fill = "none", color = guide_legend(override.aes = list(fill = NA))) + # Have to do some acrobatics for this plot: https://stackoverflow.com/a/21066173/11460621
+    scale_color_manual(values = c("rod" = "#f8766d", "transitioning" = "#00ba38", "spore" = "#83b0fc", "density" = "black")) + 
+    scale_fill_manual(values = c("rod" = "#f8766d", "transitioning" = "#00ba38", "spore" = "#83b0fc", "0.9" = "darkgrey")) +
+    theme(legend.position = "top", axis.text = element_text(size=18), legend.text = element_text(size=18), axis.title = element_text(size=18), strip.text = element_text(size=18)))
+
+ggsave("./figure_3/figure_3A_radial_proportions_model.png", bg = "white", plot = radial_proportion_plot, width = 12, height = 3.75)
+```
+
+
+
+Figure 4C + 4D Fluorescences
+Fit model
+```{r}
+cell_data_expr <- read_rds("./rds/myxo_data.rds") %>%
+  ungroup() %>%
+  filter(body_id %in% c("body_19", "body_20", "body_21",
+                        "body_22", "body_23", "body_24"),
+         time_point != "24h") %>%
+  group_by(body_id, time_point) %>%
+  mutate(promoter = ifelse(body_id %in% c("body_19", "body_20", "body_21"), "dev", "fmgE")) %>%
+  mutate(ch1_mean_log = MeanIntensity %>% log10,
+         ch2_mean_log = channel_2_MeanIntensity %>% log10,
+         time_point = ordered(time_point, c("27h", "30h", "36h", "48h"))) %>%
+  ungroup() %>%
+  filter((ch1_mean_log > log10(50) | ch2_mean_log > log10(100)))
+
+mv_formula <- bf(mvbind(ch1_mean_log, ch2_mean_log) ~ promoter + labels_factor + mo(time_point):promoter:labels_factor +
+                   (promoter + labels_factor + mo(time_point):promoter:labels_factor || body_id))
+
+generic_prior <- "student_t(3, 0, 3)"
+
+(mv_prior <- get_prior(mv_formula + set_rescor(FALSE), data = cell_data_expr))
+mv_prior$prior[mv_prior$class == "sigma"] = "exponential(2)"
+mv_prior$prior[mv_prior$class == "sd"] = "exponential(2)"
+mv_prior$prior[mv_prior$prior == "" & mv_prior$class != "simo"] = generic_prior
+mv_prior$prior[mv_prior$resp == "" ] = ""
+mv_prior$prior[mv_prior$prior == generic_prior & mv_prior$coef == ""] = ""
+(mv_prior)
+
+mv_model <- brm(mv_formula + set_rescor(FALSE), data = cell_data_expr, chains = 8, cores = 8, inits = 0, prior = mv_prior,
+                warmup = 250, iter = 750, control = list("adapt_delta" = 0.99, "metric" = "diag_e", "max_treedepth" = 20))
+
+write_rds(mv_model, "./rds/model_rds/fluor_mv_model.rds", compress = "gz")
+```
+
+Figure 4C + 4D Fluorescences
+Contrast, hypothesis, plot.
+```{r}
+mv_model <- read_rds("./rds/model_rds/fluor_mv_model.rds")
+
+# mot = monotonically ordered time. Looking at the time "slope" from the model.
+mot_vals <- spread_draws(mv_model, regex = T, `bsp_.*`) %>%
+  mutate(dev_rod = `bsp_ch2meanlog_promoterdev:labels_factorrod:motime_point` - `bsp_ch1meanlog_promoterdev:labels_factorrod:motime_point`,
+         fmgE_rod = `bsp_ch2meanlog_promoterfmgE:labels_factorrod:motime_point` - `bsp_ch1meanlog_promoterfmgE:labels_factorrod:motime_point`,
+         dev_transitioning = `bsp_ch2meanlog_promoterdev:labels_factortransitioning:motime_point` - `bsp_ch1meanlog_promoterdev:labels_factortransitioning:motime_point`,
+         fmgE_transitioning = `bsp_ch2meanlog_promoterfmgE:labels_factortransitioning:motime_point` -`bsp_ch1meanlog_promoterfmgE:labels_factortransitioning:motime_point`,
+         dev_spore = `bsp_ch2meanlog_promoterdev:labels_factorspore:motime_point` - `bsp_ch1meanlog_promoterdev:labels_factorspore:motime_point`,
+         fmgE_spore = `bsp_ch2meanlog_promoterfmgE:labels_factorspore:motime_point` - `bsp_ch1meanlog_promoterfmgE:labels_factorspore:motime_point`) %>%
+  select(.chain, .iteration, .draw, dev_rod, fmgE_rod, dev_transitioning, fmgE_transitioning, dev_spore, fmgE_spore)
+
+mot_vals_wide <- pivot_longer(mot_vals, dev_rod:fmgE_spore, "promoter_label")
+
+mot_vals_hypothesis <- map_df(unique(mot_vals_wide$promoter_label), function(x) {
+  tt <- filter(mot_vals_wide, promoter_label == x)
+  th <- hypothesis(tt, hypothesis = "value > 0", alpha = 0.05)$hypothesis %>%
+    mutate(promoter_label = x)
+})s
+write_csv(mot_vals_hypothesis, file = "./csv/hypothesis/figure_4C_mot_hypothesis.csv")
+
+# Figure 4D
+f4d_mot_comparison <- map_df(c("dev_transitioning", "dev_spore", "fmgE_transitioning", "fmgE_spore"), function(x) {
+  ref <- ifelse(str_detect(x, "dev"), "dev_rod", "fmgE_rod")
+  tt <- filter(mot_vals_wide, promoter_label %in% c(ref, x))
+  comp <- compare_levels(tt, variable = value, by = promoter_label) %>%
+    rename(comparison = promoter_label) %>%
+    mutate(promoter_label = x)
+})
+
+f4d_mot_hypothesis <- map_df(unique(f4d_mot_comparison$comparison), function(x) {
+  tt <- filter(f4d_mot_comparison, comparison == x)
+  th <- hypothesis(tt, "value > 0", alpha = 0.05)$hypothesis %>%
+    mutate(comparison = x)
+})
+
+write_csv(f4d_mot_hypothesis, file = "./csv/hypothesis/figure_4D_mot_hypothesis.csv")
+
+(plotting_y_data <- cell_data_expr %>%
+    select(labels:ch2_mean_log) %>%
+    pivot_longer(cols = c(ch1_mean_log, ch2_mean_log), names_to = ".category") %>%
+    mutate(.category = str_replace_all(.category, "_", ""),
+           time_point = str_extract(label_time, "\\d\\dh")))
+
+(f4c_data <- data_grid(cell_data_expr, time_point, promoter, labels_factor) %>%
+    add_fitted_draws(mv_model, re_formula = NA) %>%
+    compare_levels(variable = .value, by = .category))
+
+(mv_contrasts <- f4c_data %>%
+    ggplot() +
+    stat_pointinterval(aes(x = time_point, y = .value, col = labels_factor), .width = 0.90, point_interval = median_hdci) +
+    facet_grid(promoter ~ labels_factor) +
+    labs(y = expression(log[10](relative~fluorescence~intensity)), x = "Hours PS", fill = "", col = "") +
+    scale_x_discrete(labels = c("27", "30", "36", "48")) +
+    theme(text = element_text(size = 18),
+          axis.text = element_text(size = 18),
+          strip.text = element_text(size = 18),
+          strip.text.y = element_text(size = 18, face = "italic"),
+          legend.text = element_text(size=18),
+          legend.position = "top"))
+
+ggsave(filename = "./figure_4/figure_4C_mv_fluor_model_contrast.png", mv_contrasts, width = 6, height = 6, bg = "white")
+
+f4c_hypothesis <- map_df(cross2(unique(f4c_data$labels_factor), unique(f4c_data$promoter)), function(v) {
+  td <- filter(f4c_data, labels_factor == v[[1]], promoter == v[[2]])
+  tc <- td %>%
+    compare_levels(variable = .value, by = time_point, comparison = "pairwise")
+
+  th <- map_df(unique(tc$time_point), ~hypothesis(filter(tc, time_point == .x), hypothesis = ".value > 0")$hypothesis %>%
+                 mutate(time_point = .x, labels_factor = v[[1]], promoter = v[[2]]))
+  return(th)
+})
+
+write_csv(f4c_hypothesis, file = "./csv/hypothesis/figure_4C_hypothesis.csv")
+
+f4c_hypothesis_between_labels <- map_df(cross2(unique(f4c_data$time_point), unique(f4c_data$promoter)), function(v) {
+  td <- filter(f4c_data, time_point == v[[1]], promoter == v[[2]])
+  
+  tc <- td %>%
+    compare_levels(variable = .value, by = labels_factor, comparison = "pairwise")
+
+  th <- map_df(unique(tc$labels_factor), ~hypothesis(filter(tc, labels_factor == .x), hypothesis = ".value > 0")$hypothesis %>%
+                 mutate(time_point = v[[1]], labels_factor = .x, promoter = v[[2]]))
+  return(th)
+})
+
+write_csv(f4c_hypothesis_between_labels, file = "./csv/hypothesis/f4c_hypothesis_between_labels.csv")
+
+(mv_model_fitted <- data_grid(cell_data_expr, time_point, promoter, labels_factor) %>%
+    add_fitted_draws(mv_model, re_formula = NA) %>%
+    compare_levels(variable = .value, by = .category, comparison = control))
+
+mv_model_27h_rod <- mv_model_fitted %>% 
+  filter(time_point == "27h", labels_factor == "rod")
+
+mv_model_27h_rod_duplicated <- bind_rows(
+  mv_model_27h_rod,
+  mv_model_27h_rod %>% mutate(time_point = "30h"),
+  mv_model_27h_rod %>% mutate(time_point = "36h"),
+  mv_model_27h_rod %>% mutate(time_point = "48h")
+)
+
+f4d <- mv_model_fitted %>%
+  filter(labels_factor != "rod") %>%
+  bind_rows(mv_model_27h_rod_duplicated) %>%
+  compare_levels(variable = .value, by = labels_factor, comparison = control) %>%
+  mutate(labels_factor = str_replace(labels_factor, " - rod", ""),
+         labels_factor = factor(labels_factor, levels = c("transitioning", "spore")))
+
+(time_contrast_27hrod <- f4d %>%
+    ggplot() +
+    stat_pointinterval(aes(x = time_point, y = .value, col = labels_factor), .width = 0.90,
+                       position = position_dodge(0.25), point_interval = median_hdci) +
+    facet_grid(. ~ promoter) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    labs(x = "Hours PS", y = expression(log[10](relative~fluorescence~intensity)), fill = "", col = "") +
+    scale_x_discrete(labels = c("27", "30", "36", "48")) +
+    theme(text = element_text(size = 18),
+          axis.text = element_text(size = 18),
+          strip.text.x = element_text(size = 18, face = "italic"),
+          legend.text = element_text(size=18),
+          legend.position = "top") +
+    scale_color_manual(values = c("#00BA38", "#619CFF")))
+ggsave(filename = "./figure_4/figure_4D_fluor_model_promoter_contrast_time_contrast_27h_rods.png", time_contrast_27hrod, width = 6, height = 6, bg = "white")
+
+f4d_hypothesis <- map_df(cross3(unique(f4d$time_point), unique(f4d$labels_factor), unique(f4d$promoter)), function(v) {
+  tt <- filter(f4d, time_point == v[[1]], labels_factor == v[[2]], promoter == v[[3]])
+  th <- hypothesis(tt, hypothesis = ".value > 0")$hypothesis %>%
+    mutate(time_point = v[[1]], labels_factor = v[[2]], promoter = v[[3]])
+})
+
+write_csv(f4d_hypothesis, path = "./csv/hypothesis/figure_4D_hypothesis.csv")
+
+f4d_bewteen_hypothesis <- map_df(cross2(unique(f4d$time_point), unique(f4d$promoter)), function(v) {
+  tt <- filter(f4d, time_point == v[[1]], promoter == v[[2]]) %>%
+    compare_levels(variable = .value, by = labels_factor)
+  th <- hypothesis(tt, hypothesis = ".value > 0")$hypothesis %>%
+    mutate(time_point = v[[1]], promoter = v[[2]], comparison = tt$labels_factor[1])
+  return(th)
+})
+
+write_csv(f4d_bewteen_hypothesis, path = "./csv/hypothesis/figure_4D_between_label_hypothesis.csv")
+```
+
+
+Figure 5A -- Radial distribution of fluorescence
+pDev (FB19-FB21), pFmgE (FB22-FB24).
+```{r}
+cells_dist <- read_rds("./rds/myxo_data.rds") %>%
+  filter(body_id %in% c("body_19", "body_20", "body_21", "body_22", "body_23", "body_24")) %>%
+  mutate(promoter = ifelse(body_id %in% c("body_19", "body_20", "body_21"), "dev", "fmgE"),
+         ch1_mean_log = MeanIntensity %>% log10(),
+         ch2_mean_log = channel_2_MeanIntensity %>% log10(),
+         relative_signal = (channel_2_MeanIntensity / MeanIntensity) %>% log10()) %>%
+  filter((ch1_mean_log > log10(50) | ch2_mean_log > log10(100))) %>%
+  mutate(promoter_by_time = str_c(promoter, time_point %>% as.character(), sep = "."),
+         time_point_str = str_replace(time_point, "h", " h"),
+         dummy = as.numeric(1.0))
+
+gam_condition <- function(filtered_data, label_str) {
+  print(label_str)
+  
+  formula <- bf(mvbind(ch1_mean_log, ch2_mean_log) ~ labels_factor + s(dist_from_center, by = labels_factor) +
+                  s(dist_from_center, body_id, labels_factor, dummy, bs='re') + (labels_factor|body_id),
+                sigma ~ labels_factor + s(dist_from_center, by = labels_factor) +
+                  s(dist_from_center, body_id, labels_factor, dummy, bs='re') + (labels_factor|body_id)) + set_rescor(FALSE)
+  
+  (pr <- get_prior(formula, data = filtered_data))
+  pr$prior[pr$group == "body_id"] = "exponential(0.5)"
+  pr$prior[1] = "student_t(3, 0, 2.5)"
+  
+  fit <- brm(formula, data = filtered_data, cores = 4, chains = 4, warmup = 250,
+             iter = 750, inits = 0, control = list("max_treedepth" = 15, "metric" = "diag_e", "adapt_delta" = 0.99))
+  
+  write_rds(fit, path = str_glue("./rds/model_rds/radius_intensity/{label_str}.rds"), compress = "gz")
+}
+
+future_walk2(list("27h", "27h",
+          "30h", "30h",
+          "36h", "36h",
+          "48h", "48h"),
+     list("dev", "fmgE",
+          "dev", "fmgE",
+          "dev", "fmgE",
+          "dev", "fmgE"),
+     ~ filter(cells_dist, time_point == .x, promoter == .y) %>% gam_condition(str_glue("gam_fluor_{.x}_{.y}")))
+```
+
+Figure 5A -- Radial distribution of fluorescence
+All fruiting bodies (no body effect)
+```{r}
+merge_radial_intensity <- function(filepath, name, in_body_id) {
+  print(str_glue("Loading {filepath}"))
+  fit <- read_rds(filepath)
+  
+  # This is a weird workaround for a weird error introduced by the GAM
+  body_group <- if (in_body_id %in% c("body_19", "body_20", "body_21")) {
+    c("body_19", "body_20", "body_21")
+  } else {
+    c("body_22", "body_23", "body_24")
+  }
+  
+  pred_no_body <- data_grid(fit$data, dist_from_center = seq(0, 60, 0.2), body_id = in_body_id %>% factor(levels = body_group), dummy = 0, labels_factor = c("rod", "transitioning", "spore")) %>%
+    filter(body_id == in_body_id) %>%
+    add_fitted_draws(fit, n = 1000) %>%
+    mutate(name = name,
+           promoter = str_extract(name, "(dev|fmgE)"),
+           time_point = str_extract(name, "\\d{2}h"),
+           labels_factor = factor(labels_factor, levels = c("rod", "transitioning", "spore")))
+  
+  return(pred_no_body)
+}
+
+body_lut <- c("dev" = "body_19", "fmgE" = "body_22")
+all_models <- map_df(list.files("./rds/model_rds/radius_intensity", pattern = ".*fluor.*\\.rds$", full.names = T),
+                     ~ merge_radial_intensity(.x, str_extract(.x, "(?<=/)[A-Za-z_0-9]*(?=\\.rds$)"),
+                                             body_lut[str_extract(.x, "(dev|fmgE)")] %>% unlist))
+write_rds(all_models, file = "./rds/model_rds/merged_intensity_models.rds", compress = "gz")
+```
+
+
+Figure 5A -- Radial distribution of fluorescence
+All fruiting bodies (no body effect)
+```{r}
+all_models <- read_rds("./rds/model_rds/merged_intensity_models.rds") %>%
+  mutate(labels_factor = factor(labels_factor, levels = c("rod", "transitioning", "spore")),
+         time_point_str = str_replace(time_point, "h", " h"))
+
+cell_data <- read_rds("./rds/myxo_data.rds") %>%
+  filter(body_id %in% c("body_19", "body_20", "body_21", "body_22", "body_23", "body_24")) %>%
+  mutate(dummy = 1.0,
+         promoter = ifelse(body_id %in% c("body_19", "body_20", "body_21"), "dev", "fmgE"),
+         ch1_log_mean = MeanIntensity %>% log10(),
+         relative_signal = (channel_2_MeanIntensity / MeanIntensity) %>% log10())
+
+all_models_contrast <- all_models %>%
+  ungroup() %>%
+  group_by(dist_from_center, labels_factor, time_point, promoter) %>%
+  compare_levels(variable = .value, by = .category, comparison = list(c("ch2meanlog", "ch1meanlog"))) %>%
+  mutate(time_point_str = str_replace(time_point, "h", " h"))
+
+# Relative plot no rods
+(radial_intensity_plot_norods <- all_models_contrast %>% 
+    filter(labels_factor != "rod") %>%
+    ggplot() +
+    stat_lineribbon(aes(x = dist_from_center, y = .value, col = labels_factor, fill = labels_factor), alpha = 0.33, .width = 0.90, point_interval = median_hdci) +
+    labs(x = "Distance from center (μm)",
+         y = expression(log[10](relative~fluorescence~intensity)), col = "", fill = "") +
+    facet_grid(promoter ~ time_point_str) +
+    scale_color_manual(values = c("transitioning" = "#00ba38", "spore" = "#83b0fc")) + 
+    scale_fill_manual(values = c("transitioning" = "#00ba38", "spore" = "#83b0fc")) +
+    guides(fill = "none") +
+    theme(text = element_text(size = 18),
+          axis.text = element_text(size = 18),
+          strip.text.x = element_text(size = 18),
+          strip.text.y = element_text(size = 18, face = "italic"),
+          legend.position = "top"))
+ggsave(filename = "./figure_5/fig5_radial_intensity_relative.png", plot = radial_intensity_plot_norods, width = 12, height = 5.25, bg = "white")
+```
+
+
+Figure 5A -- Radial distribution of fluorescence
+Contrasts all bodies (no body effect)
+```{r}
+fluorescent_gam_contrast <- function(filepath, name, body_id) {
+  print(str_glue("Loading {filepath}"))
+  fit <- read_rds(filepath)
+  
+  # This is a workaround for a weird error introduced by the GAM
+  body_group <- if (fit$data$body_id[1] %in% c("body_19", "body_20", "body_21")) {
+    c("body_19", "body_20", "body_21")
+  } else {
+    c("body_22", "body_23", "body_24")
+  }
+  
+  # find point of maximal prob
+  tt <- data_grid(fit$data, dist_from_center = seq(1, 60, 1), body_id = fit$data$body_id[1] %>% factor(levels = body_group), labels_factor = labels_factor, dummy = 0) %>%
+    filter(body_id == fit$data$body_id[1]) %>%
+    add_fitted_draws(fit, n = 1000, re_formula = NA)
+  
+  relative_fluor <- tt %>%
+    ungroup() %>%
+    group_by(dist_from_center, labels_factor, .category) %>%
+    compare_levels(variable = .value, by = .category, comparison = list(c("ch2meanlog", "ch1meanlog")))
+  
+  r_vals <- relative_fluor %>%
+    ungroup() %>%
+    group_by(.category, labels_factor, dist_from_center) %>%
+    summarise(median_val = median(.value)) 
+  
+  max_r <- map_df(c("rod", "transitioning", "spore"), function(label) {
+    tt <- filter(r_vals, labels_factor == label)
+    max_row <- which.max(tt$median_val)
+    tt[max_row,]
+  })
+  
+  max_r %>% mutate(metadata = name) %>% write_csv(str_glue("./csv/fluorescence_hypotheses/max_distances/{name}_max_fluor_distances.csv"))
+  
+  td <- relative_fluor %>%
+    filter(dist_from_center == 1 || dist_from_center == 30 || dist_from_center == 60) %>%
+    compare_levels(variable = .value, by = dist_from_center) %>%
+    mutate(run_name = name)
+  
+  map_df(cross2(td$dist_from_center %>% unique(), c("rod", "transitioning", "spore")), ~ hypothesis(filter(td, dist_from_center == .x[[1]], labels_factor == .x[[2]]),
+                                                        c(".value > 0", ".value < 0"))$hypothesis %>% mutate(r_comparison = .x[[1]], labels_factor = .x[[2]])) %>%
+    mutate(metadata = name) %>%
+    write_csv(str_glue("./csv/fluorescence_hypotheses/figure_5_{name}_hypothesis.csv"))
+}
+
+all_contrasts <- walk(list.files("./rds/model_rds/radius_intensity", pattern = ".*\\.rds", full.names = T),
+                        ~ fluorescent_gam_contrast(.x, str_extract(.x, "(?<=/)[A-Za-z_0-9\\.]*(?=\\.rds$)"), "body_01"))
+```
